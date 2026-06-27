@@ -1,6 +1,6 @@
 # Security Notes
 
-Hermes Browser Extension v0.1 is intentionally read-only.
+Hermes Browser Extension v0.1.5 is intentionally read-only.
 
 ## Current permission model
 
@@ -10,7 +10,7 @@ The extension asks for:
 - `tabs` — read active/open tab titles and URLs.
 - `activeTab` — interact with the active tab after the user opens the extension.
 - `scripting` — inject/read the content script when needed.
-- `storage` — store local settings and the API key.
+- `storage` — store local settings and the API key/browser token.
 - `http://*/*` and `https://*/*` host permissions — read normal web pages in the active browser window.
 - `http://127.0.0.1/*` and `http://localhost/*` — talk to the local Hermes Gateway API.
 
@@ -46,6 +46,14 @@ v0.1 refuses to read:
 
 This is a conservative first pass, not a complete security boundary.
 
-## API key storage
+## API key / browser token storage
 
-The Hermes API key is stored in `chrome.storage.local` for the extension. Do not publish screenshots or exported extension storage containing the key.
+The Hermes API key/browser token is stored in `chrome.storage.local` for the extension. It is masked after save, and v0.1.5 includes **Clear stored token** in Settings.
+
+Do not publish screenshots or exported extension storage containing the key.
+
+## Related docs
+
+- [PERMISSIONS.md](PERMISSIONS.md)
+- [DATA-FLOW.md](DATA-FLOW.md)
+- [PRIVACY.md](PRIVACY.md)

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.5 — 2026-06-27
+
+- Added a Hermes compatibility panel backed by `/v1/capabilities`, with legacy fallback when older gateways do not advertise feature support.
+- Made first-run Connect avoid missing pairing routes: unsupported runtimes now go straight to Manual setup with Gateway URL/token guidance.
+- Added capability-gated voice dictation: Hermes STT is used when advertised, otherwise the side panel and visible voice page use Browser speech fallback when available.
+- Added token hygiene UI with masked token state, connection mode, last-tested timestamp, and one-click token clearing.
+- Added a collapsible “What Hermes saw” receipt after each sent turn so users can inspect tab/context/attachment/redaction payloads.
+- Gated image upload and profile APIs behind capabilities so missing routes become clear fallback warnings instead of broken UX.
+- Added public permissions, data-flow, and privacy docs for the current shipped extension behavior.
+
 ## v0.1.4 — 2026-06-26
 
 - Added editable Hermes session titles, including first-message auto-naming for new Browser sessions.

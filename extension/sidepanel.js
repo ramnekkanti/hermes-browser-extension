@@ -48,6 +48,13 @@ import { extractYouTubeVideoId } from './lib/transcript.mjs';
 import { buildDashboardWsUrl, createGatewayClient, WS_EVENTS, WS_METHODS } from './lib/gateway-ws.mjs';
 import { mintWsTicket, ticketFailureHelp } from './lib/dashboard-bridge.mjs';
 import {
+  DEFAULT_GATEWAY_CAPABILITIES,
+  buildContextReceipt,
+  capabilityStatusRows,
+  connectionSecuritySummary,
+  normalizeGatewayCapabilities,
+} from './lib/capabilities.mjs';
+import {
   DEFAULT_AGENT_PORTS,
   activeAgents,
   discoverLocalAgents,
@@ -143,6 +150,10 @@ const els = {
   profileSelect: $('#profileSelect'),
   refreshProfilesButton: $('#refreshProfilesButton'),
   profileStatus: $('#profileStatus'),
+  compatibilityList: $('#compatibilityList'),
+  compatibilityStatus: $('#compatibilityStatus'),
+  connectionSecuritySummary: $('#connectionSecuritySummary'),
+  clearTokenButton: $('#clearTokenButton'),
   agentList: $('#agentList'),
   refreshAgentsButton: $('#refreshAgentsButton'),
   addCustomAgentButton: $('#addCustomAgentButton'),
@@ -186,6 +197,7 @@ let connectionProbeStatus = 'connecting';
 let connectionProbeDetail = '';
 let connectionProbeTimer = null;
 let connectionProbeInFlight = false;
+let gatewayCapabilities = { ...DEFAULT_GATEWAY_CAPABILITIES };
 const CONNECTION_PROBE_INTERVAL_MS = 30_000;
 
 // remote-dashboard mode authenticates over the dashboard WebSocket with a
@@ -239,6 +251,8 @@ function setStatus(kind, title, detail) {
 function openSettingsDialog() {
   renderVersionInfo();
   syncSettingsForm();
+  renderCompatibilityPanel();
+  renderConnectionSecurity();
   els.settingsDialog.hidden = false;
   els.settingsDialog.setAttribute('aria-hidden', 'false');
   els.apiKeyInput.focus();
@@ -281,6 +295,98 @@ function renderGatewayHelp() {
   });
   if (els.gatewayHelp) els.gatewayHelp.textContent = summary.setupHint;
   if (els.gatewayUrlInput) els.gatewayUrlInput.placeholder = summary.mode.defaultUrl || DEFAULT_SETTINGS.gatewayUrl;
+}
+
+function renderCompatibilityPanel() {
+  if (!els.compatibilityList) return;
+  const rows = capabilityStatusRows(gatewayCapabilities, { browserSpeechAvailable: Boolean(speechRecognitionConstructor()) });
+  els.compatibilityList.innerHTML = '';
+  for (const row of rows) {
+    const item = document.createElement('li');
+    item.className = `compatibility-row ${row.status || 'warn'}`;
+    const label = document.createElement('span');
+    label.textContent = row.label;
+    const state = document.createElement('strong');
+    state.textContent = row.status === 'ok' ? 'available' : 'fallback';
+    const detail = document.createElement('small');
+    detail.textContent = row.detail;
+    item.append(label, state, detail);
+    els.compatibilityList.appendChild(item);
+  }
+  if (els.compatibilityStatus) {
+    const fallbackCount = rows.filter((row) => row.status !== 'ok').length;
+    els.compatibilityStatus.textContent = fallbackCount
+      ? `${fallbackCount} feature${fallbackCount === 1 ? '' : 's'} using fallback/manual mode.`
+      : 'Connected runtime advertises the full extension compatibility surface.';
+  }
+}
+
+function renderConnectionSecurity() {
+  if (!els.connectionSecuritySummary) return;
+  const summary = connectionSecuritySummary(settings);
+  els.connectionSecuritySummary.innerHTML = '';
+  const rows = [
+    ['Connected as', summary.modeLabel],
+    ['Gateway URL', summary.url],
+    ['Token source', summary.tokenLabel],
+    ['Stored token', summary.maskedToken],
+    ['Last tested', summary.lastTestedLabel],
+  ];
+  for (const [labelText, valueText] of rows) {
+    const row = document.createElement('div');
+    const label = document.createElement('span');
+    label.textContent = labelText;
+    const value = document.createElement('strong');
+    value.textContent = valueText;
+    row.append(label, value);
+    els.connectionSecuritySummary.appendChild(row);
+  }
+  if (els.clearTokenButton) els.clearTokenButton.disabled = !summary.hasToken;
+}
+
+function setGatewayCapabilities(caps) {
+  gatewayCapabilities = caps || { ...DEFAULT_GATEWAY_CAPABILITIES };
+  renderCompatibilityPanel();
+  updateVoiceButtonState();
+}
+
+async function loadGatewayCapabilities({ quiet = false, publicOnly = false, healthOk = false } = {}) {
+  if (isRemoteWsMode()) {
+    setGatewayCapabilities({
+      ...DEFAULT_GATEWAY_CAPABILITIES,
+      source: 'remote-dashboard',
+      health: remoteWsConnection?.client?.readyState === 1,
+      auth: true,
+      models: true,
+      sessions: true,
+      sessionChat: true,
+      sessionChatStreaming: true,
+      skills: true,
+      dashboardWs: true,
+      warnings: [
+        'Remote dashboard mode uses WebSocket session/chat APIs; REST-only browser extension APIs stay unavailable.',
+        'Voice transcription unavailable — using browser speech fallback when available.',
+        'Image upload unavailable — pasted images stay inline only.',
+        'Automatic browser pairing unavailable — manual dashboard sign-in is required.',
+      ],
+    });
+    return gatewayCapabilities;
+  }
+  try {
+    const fetcher = publicOnly || !settings.apiKey ? publicApiFetch : apiFetch;
+    const response = await fetcher('/v1/capabilities', { method: 'GET', cache: 'no-store' });
+    const payload = await readJsonResponse(response);
+    if (!response.ok) throw new Error(`GET /v1/capabilities failed (${response.status})`);
+    setGatewayCapabilities(normalizeGatewayCapabilities(payload, { healthOk: true, hasApiKey: Boolean(settings.apiKey) }));
+  } catch (error) {
+    setGatewayCapabilities(normalizeGatewayCapabilities(null, {
+      healthOk,
+      hasApiKey: Boolean(settings.apiKey),
+      warning: error?.message || String(error),
+    }));
+    if (!quiet) setStatus('warn', 'Hermes compatibility fallback', 'This gateway does not expose /v1/capabilities yet. Browser-specific routes will stay in fallback mode.');
+  }
+  return gatewayCapabilities;
 }
 
 // The gateway mode is stored as a flat value (local-api/remote-api/
@@ -467,6 +573,14 @@ function canRecordVoiceAudio() {
   return Boolean(navigator.mediaDevices?.getUserMedia && typeof MediaRecorder !== 'undefined');
 }
 
+function canUseHermesVoiceTranscription() {
+  return Boolean(settings.apiKey && gatewayCapabilities.audioTranscription && canRecordVoiceAudio());
+}
+
+function browserSpeechAvailable() {
+  return Boolean(speechRecognitionConstructor());
+}
+
 function preferredVoiceMimeType() {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') return '';
   return VOICE_AUDIO_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) || '';
@@ -629,13 +743,14 @@ async function getMicrophoneStreamWithPermissionRetry() {
 
 function updateVoiceButtonState() {
   if (!els.voiceButton) return;
-  const supported = canRecordVoiceAudio() || Boolean(speechRecognitionConstructor());
+  const supported = canUseHermesVoiceTranscription() || browserSpeechAvailable();
   els.voiceButton.disabled = !supported;
   els.voiceButton.classList.toggle('recording', dictating);
   els.voiceButton.classList.toggle('active', dictating);
+  const mode = canUseHermesVoiceTranscription() ? 'Hermes STT' : 'browser speech fallback';
   els.voiceButton.title = !supported
-    ? 'Voice dictation is not supported in this browser'
-    : (dictating ? 'Stop voice dictation' : 'Start voice dictation');
+    ? 'Voice dictation is not supported in this browser or connected Hermes runtime'
+    : (dictating ? `Stop voice dictation (${mode})` : `Start voice dictation (${mode})`);
   els.voiceButton.setAttribute('aria-label', els.voiceButton.title);
 }
 
@@ -663,6 +778,11 @@ function cleanupVoiceRecorder() {
 }
 
 async function transcribeVoiceRecording(blob) {
+  if (!canUseHermesVoiceTranscription()) {
+    const error = new Error('Hermes audio transcription is unavailable on this gateway.');
+    error.fallbackToWebSpeech = true;
+    throw error;
+  }
   const dataUrl = await blobToDataUrl(blob);
   const response = await apiFetch(AUDIO_TRANSCRIBE_ENDPOINT, {
     method: 'POST',
@@ -806,7 +926,9 @@ async function toggleVoiceDictation() {
   }
   dictationBaseText = els.input.value.trim();
   dictationFinalText = '';
-  if (canRecordVoiceAudio()) {
+  await loadGatewayCapabilities({ quiet: true, healthOk: isConnected() }).catch(() => {});
+  if (!canUseHermesVoiceTranscription() && startWebSpeechDictation('Hermes transcription route is unavailable. Using browser speech fallback.')) return;
+  if (canUseHermesVoiceTranscription()) {
     try {
       await startRecorderDictation();
       return;
@@ -1056,6 +1178,13 @@ async function uploadImageAttachment(attachment) {
   if (!attachment || attachment.kind !== 'image' || !attachment.dataUrl || attachment.localPath || !settings.apiKey) {
     return attachment;
   }
+  if (!gatewayCapabilities.imageUpload) {
+    return {
+      ...attachment,
+      uploadSkipped: true,
+      uploadError: 'Image upload unavailable — pasted image stayed inline only.',
+    };
+  }
   const response = await apiFetch(BROWSER_IMAGE_UPLOAD_ENDPOINT, {
     method: 'POST',
     body: JSON.stringify({
@@ -1093,6 +1222,7 @@ async function saveImageAttachmentsForTurn(items = []) {
   if (!settings.apiKey) return items;
   let saved = 0;
   let failed = 0;
+  let skipped = 0;
   const next = [];
   for (const attachment of items) {
     if (attachment.kind !== 'image' || !attachment.dataUrl || attachment.localPath) {
@@ -1102,6 +1232,7 @@ async function saveImageAttachmentsForTurn(items = []) {
     try {
       const uploaded = await uploadImageAttachment(attachment);
       if (uploaded.localPath) saved += 1;
+      if (uploaded.uploadSkipped) skipped += 1;
       next.push(uploaded);
     } catch (error) {
       failed += 1;
@@ -1109,6 +1240,7 @@ async function saveImageAttachmentsForTurn(items = []) {
     }
   }
   if (saved) setStatus('ok', 'Image ready for Hermes vision', `${saved} pasted image${saved === 1 ? '' : 's'} saved locally`);
+  if (skipped) setStatus('warn', 'Image stayed inline only', `${skipped} image${skipped === 1 ? '' : 's'} kept as inline context because this Hermes runtime has no image upload route.`);
   if (failed) setStatus('warn', 'Image stayed inline only', `${failed} image${failed === 1 ? '' : 's'} could not be saved locally`);
   return next;
 }
@@ -1709,9 +1841,12 @@ function renderProfiles() {
 }
 
 async function loadProfiles({ quiet = false } = {}) {
-  if (!settings.apiKey) {
+  if (!settings.apiKey || gatewayCapabilities.profiles === false) {
     availableProfiles = [];
     renderProfiles();
+    if (!quiet && settings.apiKey && gatewayCapabilities.profiles === false) {
+      setStatus('warn', 'Profile API unavailable', 'Using the currently running Hermes gateway profile.');
+    }
     return;
   }
   try {
@@ -2258,6 +2393,24 @@ function addMessage(role, content, { persist = true } = {}) {
   return { node, record };
 }
 
+function appendContextReceipt(messageNode, receipt = { title: 'What Hermes saw', items: [] }) {
+  if (!messageNode || !receipt?.items?.length) return;
+  const details = document.createElement('details');
+  details.className = 'context-receipt';
+  const summary = document.createElement('summary');
+  summary.textContent = receipt.title || 'What Hermes saw';
+  const list = document.createElement('dl');
+  for (const item of receipt.items) {
+    const term = document.createElement('dt');
+    term.textContent = item.label;
+    const value = document.createElement('dd');
+    value.textContent = item.value;
+    list.append(term, value);
+  }
+  details.append(summary, list);
+  messageNode.appendChild(details);
+}
+
 function setMessageContent(node, content) {
   renderMessageContentElement(node.querySelector('.message-content'), content || '');
   requestAnimationFrame(() => {
@@ -2350,12 +2503,16 @@ function syncSettingsForm() {
   if (els.agentSchemeInput) els.agentSchemeInput.value = normalizeAgentDiscoveryScheme(settings.agentDiscoveryScheme || DEFAULT_SETTINGS.agentDiscoveryScheme);
   if (els.agentPortsInput) els.agentPortsInput.value = getAgentPorts().join(',');
   els.transcriptProviderInput.value = settings.transcriptProvider || DEFAULT_SETTINGS.transcriptProvider;
+  renderCompatibilityPanel();
+  renderConnectionSecurity();
 }
 
 async function saveSettingsFromForm() {
   const previousSettings = { ...settings };
   const selected = availableModels.find((model) => model.id === settings.model);
   const apiKey = els.apiKeyInput.value.trim();
+  const previousApiKey = String(previousSettings.apiKey || '');
+  const tokenSource = apiKey ? (apiKey === previousApiKey ? (previousSettings.tokenSource || settings.tokenSource || 'manual') : 'manual') : '';
   // The UI only picks Local vs Remote; for Remote the transport is inferred
   // from the key (present = API server, blank = dashboard WebSocket).
   const remote = gatewayLocationOf(els.gatewayModeInput?.value || settings.gatewayMode) === 'remote';
@@ -2369,6 +2526,7 @@ async function saveSettingsFromForm() {
     gatewayMode,
     gatewayUrl,
     apiKey,
+    tokenSource,
     model: settings.model || DEFAULT_SETTINGS.model,
     modelContextTokens: selected?.contextTokens || settings.modelContextTokens || 0,
     sessionId: els.sessionIdInput.value.trim() || DEFAULT_SETTINGS.sessionId,
@@ -2391,6 +2549,17 @@ async function saveSettingsFromForm() {
   await maybeRenameCurrentSessionTitle(previousSettings, settings.sessionTitle);
   syncSettingsForm();
   updateConnectionPrompt();
+}
+
+async function clearStoredToken() {
+  settings = { ...settings, apiKey: '', tokenSource: '', lastConnectionTestedAt: 0 };
+  await chrome.storage.local.set({ hermesBrowserSettings: settings });
+  if (els.apiKeyInput) els.apiKeyInput.value = '';
+  sessionRoutesAvailable = null;
+  markConnectionProbe('unconfigured', 'Token cleared by user.');
+  setGatewayCapabilities(normalizeGatewayCapabilities(null, { healthOk: false, hasApiKey: false, warning: 'Token cleared; reconnect to refresh capabilities.' }));
+  syncSettingsForm();
+  setStatus('warn', 'Hermes token cleared', 'Paste a Gateway API key or reconnect when you are ready.');
 }
 
 async function activeTab() {
@@ -2698,7 +2867,7 @@ function markGatewayUnreachable(error) {
 }
 
 async function ensureHermesSession() {
-  if (sessionRoutesAvailable === false) return false;
+  if (sessionRoutesAvailable === false || gatewayCapabilities.sessions === false || gatewayCapabilities.sessionChat === false) return false;
   const sessionPath = `/api/sessions/${encodeSessionId(settings.sessionId)}`;
   const getResponse = await apiFetch(sessionPath, { method: 'GET' });
   if (getResponse.ok) {
@@ -3091,6 +3260,15 @@ async function connectToHermes() {
     const health = await publicApiFetch('/health', { method: 'GET' });
     if (!health.ok) throw new Error(`Hermes API server is not reachable (${health.status}).`);
 
+    const capabilities = await loadGatewayCapabilities({ quiet: true, publicOnly: true, healthOk: true });
+    if (!capabilities.browserPairing) {
+      markConnectionProbe('unconfigured', 'Manual setup required; automatic browser pairing is not advertised by this Hermes runtime.');
+      els.connectStatus.textContent = 'Automatic pairing is not available on this Hermes runtime. Open Settings and use Manual setup with your Gateway URL and API token.';
+      setStatus('warn', 'Manual setup required', 'This Hermes runtime does not advertise browser pairing yet.');
+      openSettingsDialog();
+      return;
+    }
+
     const start = await publicApiFetch('/api/browser-extension/pair/start', {
       method: 'POST',
       body: JSON.stringify({
@@ -3109,9 +3287,12 @@ async function connectToHermes() {
       settings.apiKey = await pollPairing(payload.pairing_id);
     }
 
+    settings.tokenSource = 'pairing';
+    settings.lastConnectionTestedAt = Date.now();
     await chrome.storage.local.set({ hermesBrowserSettings: settings });
     syncSettingsForm();
     updateConnectionPrompt();
+    await loadGatewayCapabilities({ quiet: true, healthOk: true });
     await loadModels({ quiet: true });
     await loadSkills({ quiet: true });
     await loadProfiles({ quiet: true });
@@ -3214,7 +3395,9 @@ async function askHermes(userText, turnAttachments = [...attachments]) {
       settings,
     });
 
-    addMessage('user', displayUserText);
+    const receipt = buildContextReceipt({ context, attachments: preparedAttachments, settings });
+    const { node: userNode } = addMessage('user', displayUserText);
+    appendContextReceipt(userNode, receipt);
     const { node } = addMessage('assistant', 'Thinking...', { persist: false });
     const streamView = createStreamingMessageUpdater(node);
     let answer = '';
@@ -3317,12 +3500,16 @@ async function testConnection() {
       updateConnectionPrompt();
       markGatewayReachable(`${normalizeGatewayUrl(settings.gatewayUrl)}${modelNote}`);
       setStatus('ok', 'Remote Hermes dashboard connected', `${normalizeGatewayUrl(settings.gatewayUrl)}${modelNote}`);
+      settings = { ...settings, lastConnectionTestedAt: Date.now() };
+      await chrome.storage.local.set({ hermesBrowserSettings: settings });
+      renderConnectionSecurity();
       ok = true;
       return;
     }
     const response = await apiFetch('/health', { method: 'GET' });
     const text = await response.text();
     if (!response.ok) throw new Error(`${response.status}: ${text}`);
+    await loadGatewayCapabilities({ quiet: true, healthOk: true });
 
     const modelsResponse = await apiFetch('/v1/models', { method: 'GET' });
     const modelsPayload = await readJsonResponse(modelsResponse);
@@ -3338,6 +3525,9 @@ async function testConnection() {
       hasSessionRoutes ? normalizeGatewayUrl(settings.gatewayUrl) : `${normalizeGatewayUrl(settings.gatewayUrl)} - OpenAI-compatible fallback mode`,
     );
     markGatewayReachable(normalizeGatewayUrl(settings.gatewayUrl));
+    settings = { ...settings, lastConnectionTestedAt: Date.now() };
+    await chrome.storage.local.set({ hermesBrowserSettings: settings });
+    renderConnectionSecurity();
     ok = true;
   } catch (error) {
     markGatewayUnreachable(error);
@@ -3558,6 +3748,9 @@ function bindEvents() {
     els.contextBarButton.setAttribute('aria-expanded', String(!nextHidden));
   });
   els.testConnectionButton.addEventListener('click', testConnection);
+  els.clearTokenButton?.addEventListener('click', () => {
+    clearStoredToken().catch((error) => setStatus('warn', 'Could not clear token', error?.message || String(error)));
+  });
   els.gatewayModeInput?.addEventListener('change', () => {
     const summary = currentGatewaySummary({ gatewayMode: els.gatewayModeInput.value, gatewayUrl: els.gatewayUrlInput.value });
     if (!els.gatewayUrlInput.value.trim() || els.gatewayUrlInput.value.trim() === DEFAULT_SETTINGS.gatewayUrl) {
@@ -3596,6 +3789,7 @@ function bindEvents() {
       await saveSettingsFromForm();
       await probeGatewayLiveness({ quiet: false });
       if (settings.apiKey && isConnected()) {
+        await loadGatewayCapabilities({ quiet: true, healthOk: true });
         await loadModels({ quiet: true });
         await loadSkills({ quiet: true });
         await loadProfiles({ quiet: true });
@@ -3697,6 +3891,7 @@ try {
   await loadSettings();
   const state = await probeGatewayLiveness({ quiet: true });
   if (settings.apiKey && state.connected) {
+    await loadGatewayCapabilities({ quiet: true, healthOk: true });
     await loadModels({ quiet: true });
     await loadSkills({ quiet: true });
     await loadProfiles({ quiet: true });

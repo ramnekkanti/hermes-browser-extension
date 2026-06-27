@@ -31,6 +31,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   gatewayMode: 'local-api',
   gatewayUrl: 'http://127.0.0.1:8642',
   apiKey: '',
+  tokenSource: '',
+  lastConnectionTestedAt: 0,
   sessionId: 'hermes-browser-extension',
   sessionTitle: 'Hermes Browser Extension',
   sessionSource: 'hermes_browser',

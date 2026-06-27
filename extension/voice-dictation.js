@@ -5,6 +5,10 @@ import {
   normalizeGatewayUrl,
   shouldFallbackToWebSpeechForTranscription,
 } from './lib/common.mjs';
+import {
+  DEFAULT_GATEWAY_CAPABILITIES,
+  normalizeGatewayCapabilities,
+} from './lib/capabilities.mjs';
 
 const startButton = document.getElementById('startVoiceButton');
 const settingsButton = document.getElementById('openMicSettingsButton');
@@ -22,19 +26,24 @@ const VOICE_AUDIO_MIME_TYPES = Object.freeze([
 ]);
 
 let settings = { ...DEFAULT_SETTINGS };
+let capabilities = { ...DEFAULT_GATEWAY_CAPABILITIES };
 let recorder = null;
 let stream = null;
 let chunks = [];
 let recording = false;
+let speechRecognition = null;
+let speechFinalText = '';
+let speechInterimText = '';
+let speechActive = false;
 
 function setStatus(message) {
   if (statusEl) statusEl.textContent = message;
 }
 
-function setRecording(value) {
+function setRecording(value, label = '') {
   recording = Boolean(value);
   document.body.classList.toggle('recording', recording);
-  if (startButton) startButton.textContent = recording ? 'Stop + transcribe' : 'Start dictation';
+  if (startButton) startButton.textContent = recording ? `Stop${label ? ` ${label}` : ''}` : 'Start dictation';
 }
 
 function chromeRuntimeErrorMessage() {
@@ -87,6 +96,22 @@ function preferredVoiceMimeType() {
   return VOICE_AUDIO_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) || '';
 }
 
+function speechRecognitionConstructor() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function browserSpeechAvailable() {
+  return Boolean(speechRecognitionConstructor());
+}
+
+function canRecordVoiceAudio() {
+  return Boolean(navigator.mediaDevices?.getUserMedia && typeof MediaRecorder !== 'undefined');
+}
+
+function canUseHermesStt() {
+  return Boolean(settings.apiKey && capabilities.audioTranscription && canRecordVoiceAudio());
+}
+
 function stopStream() {
   stream?.getTracks?.().forEach((track) => track.stop());
   stream = null;
@@ -128,9 +153,40 @@ async function apiFetch(path, options = {}) {
   });
 }
 
-async function transcribeVoiceRecording(blob) {
+async function readJsonResponse(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text };
+  }
+}
+
+async function loadCapabilities() {
   if (!settings.apiKey) {
-    throw new Error('Hermes is not connected yet. Connect the extension to Hermes, then try dictation again.');
+    capabilities = normalizeGatewayCapabilities(null, { healthOk: false, hasApiKey: false, warning: 'No API token stored.' });
+    return capabilities;
+  }
+  try {
+    const response = await apiFetch('/v1/capabilities', { method: 'GET', cache: 'no-store' });
+    const payload = await readJsonResponse(response);
+    if (!response.ok) throw new Error(`GET /v1/capabilities failed (${response.status})`);
+    capabilities = normalizeGatewayCapabilities(payload, { healthOk: true, hasApiKey: true });
+  } catch (error) {
+    capabilities = normalizeGatewayCapabilities(null, {
+      healthOk: true,
+      hasApiKey: Boolean(settings.apiKey),
+      warning: error?.message || String(error),
+    });
+  }
+  return capabilities;
+}
+
+async function transcribeVoiceRecording(blob) {
+  if (!canUseHermesStt()) {
+    const error = new Error('Hermes audio transcription is unavailable on this gateway.');
+    error.fallbackToWebSpeech = true;
+    throw error;
   }
   const dataUrl = await blobToDataUrl(blob);
   const response = await apiFetch(AUDIO_TRANSCRIBE_ENDPOINT, {
@@ -148,11 +204,11 @@ async function transcribeVoiceRecording(blob) {
   return String(payload?.transcript || '').trim();
 }
 
-async function publishTranscript(transcript) {
+async function publishTranscript(transcript, source = 'voice-dictation-page') {
   const payload = {
     type: 'HERMES_VOICE_TRANSCRIPT',
     transcript,
-    source: 'voice-dictation-page',
+    source,
     ts: Date.now(),
   };
   try {
@@ -172,9 +228,85 @@ function isMicrophoneBlocked(error) {
   return /notallowed|permission|denied|dismissed|blocked|not-readable|notreadable/.test(text);
 }
 
+function ensureBrowserSpeech() {
+  if (speechRecognition) return speechRecognition;
+  const Recognition = speechRecognitionConstructor();
+  if (!Recognition) return null;
+  const recognition = new Recognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = navigator.language || 'en-US';
+  recognition.onresult = (event) => {
+    speechInterimText = '';
+    for (let index = event.resultIndex; index < event.results.length; index += 1) {
+      const transcript = event.results[index]?.[0]?.transcript || '';
+      if (event.results[index]?.isFinal) speechFinalText = `${speechFinalText} ${transcript}`.trim();
+      else speechInterimText = `${speechInterimText} ${transcript}`.trim();
+    }
+    const preview = [speechFinalText, speechInterimText].filter(Boolean).join(' ');
+    setStatus(`Voice mode: Browser speech fallback\n\n${preview || 'Listening… speak now, then click Stop.'}`);
+  };
+  recognition.onerror = (event) => {
+    setStatus(`Browser speech fallback stopped.\n\n${event.error || 'Speech recognition error'}`);
+  };
+  recognition.onend = async () => {
+    const transcript = [speechFinalText, speechInterimText].filter(Boolean).join(' ').trim();
+    speechActive = false;
+    setRecording(false);
+    startButton.disabled = false;
+    if (!transcript) {
+      setStatus('Voice mode: Browser speech fallback\n\nNo speech detected. Click Start dictation and try again.');
+      return;
+    }
+    await publishTranscript(transcript, 'browser-speech-fallback');
+    setStatus(`Transcript sent to the Hermes side panel:\n\n${transcript}`);
+    setTimeout(() => window.close(), 1600);
+  };
+  speechRecognition = recognition;
+  return speechRecognition;
+}
+
+function startBrowserSpeechFallback() {
+  const recognition = ensureBrowserSpeech();
+  if (!recognition) {
+    setStatus('Voice mode unavailable. This browser does not expose Hermes STT or Web Speech fallback.');
+    return false;
+  }
+  speechFinalText = '';
+  speechInterimText = '';
+  try {
+    startButton.disabled = false;
+    recognition.start();
+    speechActive = true;
+    setRecording(true, 'speech');
+    setStatus('Voice mode: Browser speech fallback\n\nListening… speak now, then click Stop.');
+    return true;
+  } catch (error) {
+    speechActive = false;
+    setRecording(false);
+    setStatus(`Browser speech fallback could not start.\n\n${error?.message || String(error)}`);
+    return false;
+  }
+}
+
+function stopBrowserSpeechFallback() {
+  if (!speechActive) return false;
+  startButton.disabled = true;
+  setStatus('Stopping browser speech fallback…');
+  try {
+    speechRecognition?.stop?.();
+  } catch (error) {
+    startButton.disabled = false;
+    speechActive = false;
+    setRecording(false);
+    setStatus(`Browser speech fallback could not stop.\n\n${error?.message || String(error)}`);
+  }
+  return true;
+}
+
 async function startRecording() {
   startButton.disabled = true;
-  setStatus('Requesting microphone access…');
+  setStatus('Voice mode: Hermes STT\n\nRequesting microphone access…');
   try {
     const permitted = await ensureExtensionAudioPermission();
     if (!permitted) throw new DOMException('audioCapture permission was not granted', 'NotAllowedError');
@@ -209,24 +341,26 @@ async function startRecording() {
           setStatus('No speech detected. Click Start dictation and try again.');
           return;
         }
-        await publishTranscript(transcript);
+        await publishTranscript(transcript, 'hermes-stt');
         setStatus(`Transcript sent to the Hermes side panel:\n\n${transcript}`);
         setTimeout(() => window.close(), 1600);
       } catch (error) {
-        const extra = error?.fallbackToWebSpeech ? '\n\nHermes transcription route is unavailable in this gateway; update Hermes or use browser speech fallback if available.' : '';
-        setStatus(`Voice transcription failed.\n\n${error?.message || String(error)}${extra}`);
+        if (error?.fallbackToWebSpeech && startBrowserSpeechFallback()) return;
+        setStatus(`Voice transcription failed.\n\n${error?.message || String(error)}`);
       } finally {
         startButton.disabled = false;
       }
     };
     recorder.start();
-    setRecording(true);
-    setStatus('Recording… speak now, then click Stop + transcribe.');
+    setRecording(true, '+ transcribe');
+    setStatus('Voice mode: Hermes STT\n\nRecording… speak now, then click Stop + transcribe.');
   } catch (error) {
     setRecording(false);
     stopStream();
     if (isMicrophoneBlocked(error)) {
       setStatus(`Microphone permission is blocked for Hermes Browser Extension.\n\nClick Open microphone settings, set Microphone to Allow for this extension, return here, then click Start dictation again.\n\n${error?.message || String(error)}`);
+    } else if (startBrowserSpeechFallback()) {
+      return;
     } else {
       setStatus(`Could not start voice dictation.\n\n${error?.message || String(error)}`);
     }
@@ -236,28 +370,52 @@ async function startRecording() {
 }
 
 function stopRecording() {
-  if (!recorder || recorder.state === 'inactive') return;
+  if (!recorder || recorder.state === 'inactive') return false;
   startButton.disabled = true;
   setStatus('Stopping recording…');
   recorder.stop();
+  return true;
+}
+
+async function startBestVoiceMode() {
+  await loadCapabilities();
+  if (canUseHermesStt()) {
+    await startRecording();
+    return;
+  }
+  if (startBrowserSpeechFallback()) return;
+  if (!settings.apiKey) {
+    setStatus('Voice mode unavailable. Connect Hermes for STT, or use a Chromium build that supports browser speech fallback.');
+  } else {
+    setStatus('Voice mode unavailable. This Hermes runtime has no audio transcription route and this browser exposes no Web Speech fallback.');
+  }
 }
 
 startButton?.addEventListener('click', () => {
-  if (recording) stopRecording();
-  else startRecording();
+  if (recording) {
+    if (stopRecording()) return;
+    if (stopBrowserSpeechFallback()) return;
+  } else {
+    startBestVoiceMode().catch((error) => setStatus(`Could not start voice dictation.\n\n${error?.message || String(error)}`));
+  }
 });
 settingsButton?.addEventListener('click', openMicrophoneSettings);
 closeButton?.addEventListener('click', () => window.close());
 
 try {
   const loadedFromExtensionStorage = await loadSettings();
-  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+  await loadCapabilities();
+  if (!loadedFromExtensionStorage) {
+    setStatus('Preview mode: load this page from the installed Hermes Browser Extension to use connected Hermes settings and voice dictation.');
+  } else if (canUseHermesStt()) {
+    setStatus('Voice mode: Hermes STT\n\nAudio is sent once to your configured Hermes transcription endpoint when you stop recording.');
+  } else if (browserSpeechAvailable()) {
+    setStatus('Voice mode: Browser speech fallback\n\nHermes STT is unavailable on this gateway. Speech recognition runs in the browser; only the transcript is sent back to the side panel.');
+  } else if (!canRecordVoiceAudio()) {
     startButton.disabled = true;
-    setStatus('This Chromium browser does not expose MediaRecorder/getUserMedia to extension pages.');
-  } else if (!loadedFromExtensionStorage) {
-    setStatus('Preview mode: load this page from the installed Hermes Browser Extension to use connected Hermes settings and voice transcription.');
+    setStatus('This Chromium browser does not expose MediaRecorder/getUserMedia to extension pages, and Web Speech fallback is unavailable.');
   } else if (!settings.apiKey) {
-    setStatus('Hermes is not connected yet. Connect the side panel to Hermes, then use voice dictation.');
+    setStatus('Hermes is not connected yet. Browser speech fallback is unavailable here; connect the side panel to Hermes, then use voice dictation.');
   }
 } catch (error) {
   setStatus(`Could not load Hermes Browser settings.\n\n${error?.message || String(error)}`);

@@ -73,8 +73,8 @@
     <main class="voice-card" aria-labelledby="voiceTitle">
       <p class="eyebrow">HERMES BROWSER EXTENSION</p>
       <h1 id="voiceTitle">Voice dictation</h1>
-      <p>Chromium can block microphone capture inside extension side panels. This visible extension tab records from the same Hermes extension origin, transcribes through your connected local Hermes gateway, then sends the transcript back to the side panel composer.</p>
-      <p>No audio is saved by this page. Audio is sent once to your local Hermes transcription endpoint when you stop recording.</p>
+      <p>Chromium can block microphone capture inside extension side panels. This visible extension tab records from the same Hermes extension origin when Hermes STT is available, or uses Browser speech fallback when the connected runtime does not expose audio transcription.</p>
+      <p>No audio is saved by this page. In Hermes STT mode, audio is sent once to your configured Hermes transcription endpoint when you stop recording. In Browser speech fallback mode, only the transcript is sent back to the side panel.</p>
       <div class="voice-meter" aria-hidden="true"><span></span></div>
       <div class="voice-actions">
         <button id="startVoiceButton" type="button">Start dictation</button>

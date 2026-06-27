@@ -177,7 +177,7 @@
           <div class="release-row">
             <div>
               <h3 id="releaseTitle">Extension</h3>
-              <p><span id="versionLabel">v0.1.3</span> · public alpha / load unpacked</p>
+              <p><span id="versionLabel">version loading…</span> · public alpha / load unpacked</p>
             </div>
             <button id="checkUpdatesButton" class="secondary" type="button">Check updates</button>
           </div>
@@ -329,6 +329,25 @@
         </div>
 
         <p class="hint">Public flow: Connect to Hermes creates a scoped browser token when the API server supports pairing. For remote hosts, set API_SERVER_CORS_ORIGINS to this extension origin and use a strong API_SERVER_KEY or scoped token.</p>
+
+        <div class="compatibility-panel" aria-labelledby="compatibilityTitle">
+          <div>
+            <h4 id="compatibilityTitle">Hermes compatibility</h4>
+            <p id="compatibilityStatus" class="hint">Connect or test your Gateway to see supported features.</p>
+          </div>
+          <ul id="compatibilityList" class="compatibility-list"></ul>
+        </div>
+
+        <div class="connection-security" aria-labelledby="connectionSecurityTitle">
+          <div class="settings-section-head">
+            <div>
+              <h4 id="connectionSecurityTitle">Connection security</h4>
+              <p>Tokens are stored in chrome.storage.local and never displayed after save.</p>
+            </div>
+          </div>
+          <div id="connectionSecuritySummary" class="connection-security-summary"></div>
+          <button id="clearTokenButton" class="secondary" type="button">Clear stored token</button>
+        </div>
         </section>
 
         <footer>

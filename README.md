@@ -17,7 +17,7 @@ Browser-native side panel for [Hermes Agent](https://hermes-agent.nousresearch.c
 
 Hermes Browser Extension is not a browser chatbot. It is a Chrome/Edge/Chromium side panel for the real Hermes Agent runtime. It talks to your Hermes Gateway/API server — local by default, remote when you configure a reachable URL — so it can use the models, tools, skills, sessions, memory, and MCP servers already configured in Hermes.
 
-This repo is specifically for the **extension**. A future standalone **Hermes Browser** may become a separate native macOS/Linux/Windows app built on the groundwork from this extension.
+This repo is specifically for the **Hermes Browser Extension**: the Chrome/Edge/Chromium side-panel integration for Hermes Agent.
 
 ## Visual tour
 
@@ -31,9 +31,11 @@ This repo is specifically for the **extension**. A future standalone **Hermes Br
 - Connects to a configurable local or remote Hermes API server. Default: `http://127.0.0.1:8642`.
 - Supports dashboard WebSocket mode when you have a signed-in remote Hermes dashboard tab and no API key.
 - Auto-syncs connected Hermes providers/models, profiles, skills, sessions, and capabilities.
+- Shows a Hermes compatibility panel so older gateways degrade into explicit fallback/manual modes instead of broken route errors.
 - Sends active tab/browser context into a persisted Hermes session.
+- Adds a collapsible “What Hermes saw” receipt after each sent turn for transparent context/debugging.
 - Captures active tab title/URL, open tabs, selected text, readable page text, metadata, headings, forms, links, and buttons where available.
-- Supports voice dictation through the local Hermes audio transcription API, with a visible extension voice-tab fallback for Chromium side-panel microphone blocks.
+- Supports voice dictation through Hermes audio transcription when available, with Browser speech fallback when the connected runtime does not expose STT.
 - Wraps webpage text as untrusted context before sending it to Hermes.
 - Streams Hermes responses and falls back to non-streaming chat when needed.
 - Includes Desktop-style appearance settings: Light/Dark/System mode plus Nous, Midnight, Ember, Mono, Cyberpunk, and Slate themes.
@@ -84,7 +86,7 @@ Local-only is the safest default. Put this in `~/.hermes/.env` on the machine ru
 API_SERVER_ENABLED=true
 API_SERVER_HOST=127.0.0.1
 API_SERVER_PORT=8642
-API_SERVER_KEY=<strong-local-secret>
+API_SERVER_KEY=<your-api-server-key>
 API_SERVER_CORS_ORIGINS=chrome-extension://<your-extension-id>
 ```
 
@@ -121,7 +123,7 @@ For a remote Hermes machine, bind the API server to a reachable trusted interfac
 API_SERVER_ENABLED=true
 API_SERVER_HOST=0.0.0.0
 API_SERVER_PORT=8642
-API_SERVER_KEY=<strong-remote-secret>
+API_SERVER_KEY=<your-api-server-key>
 API_SERVER_CORS_ORIGINS=chrome-extension://<your-extension-id>
 ```
 
@@ -170,7 +172,7 @@ Hermes Browser Extension is intentionally conservative in v0.1:
 - No `debugger`, `nativeMessaging`, `cookies`, `history`, `downloads`, or `bookmarks` permissions.
 - Restricted pages include browser internals, extension pages, and obvious banking/crypto/password/payment/health/government-tax categories.
 
-See [`SECURITY.md`](SECURITY.md) for details.
+See [`SECURITY.md`](SECURITY.md), [`PERMISSIONS.md`](PERMISSIONS.md), [`DATA-FLOW.md`](DATA-FLOW.md), and [`PRIVACY.md`](PRIVACY.md) for details.
 
 ## Troubleshooting
 
@@ -196,12 +198,18 @@ Open a normal `https://` page and refresh context. Browser internal pages (`chro
 
 ### Microphone says blocked or voice dictation does not start
 
-Chromium side panels can suppress microphone permission prompts. Hermes Browser Extension handles this with a visible extension voice page:
+Chromium side panels can suppress microphone permission prompts. Hermes Browser Extension handles this with capability-gated voice modes:
+
+- **Hermes STT** when the connected Hermes runtime advertises audio transcription.
+- **Browser speech fallback** when Hermes STT is unavailable and Chromium exposes Web Speech.
+- A visible **Hermes Voice Dictation** tab when the side panel cannot capture the mic directly.
+
+Suggested flow:
 
 1. Click the mic button in the side panel.
 2. If the side panel cannot capture the mic, a **Hermes Voice Dictation** tab opens.
 3. In that tab, click **Start dictation**. This click is the permission gesture Chromium expects.
-4. Speak, then click **Stop + transcribe**.
+4. Speak, then click **Stop + transcribe** or **Stop speech** depending on the active mode.
 5. The transcript is sent back to the side panel composer automatically.
 
 If Chromium still says the mic is blocked, click **Open microphone settings** in the voice tab and set Microphone to **Allow** for `chrome-extension://<the Hermes extension id>/`, then return to the voice tab and try again.
