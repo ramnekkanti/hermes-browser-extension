@@ -35,7 +35,17 @@ export default [
         TextEncoder: 'readonly',
         TextDecoder: 'readonly',
         Blob: 'readonly',
+        File: 'readonly',
+        FileList: 'readonly',
         FileReader: 'readonly',
+        FormData: 'readonly',
+        DOMException: 'readonly',
+        Event: 'readonly',
+        CustomEvent: 'readonly',
+        MediaRecorder: 'readonly',
+        WebSocket: 'readonly',
+        requestAnimationFrame: 'readonly',
+        cancelAnimationFrame: 'readonly',
         atob: 'readonly',
         btoa: 'readonly',
         structuredClone: 'readonly',
@@ -54,7 +64,7 @@ export default [
   },
 
   {
-    files: ['scripts/**', 'tests/**', 'extension/lib/**'],
+    files: ['scripts/**', 'tests/**'],
     languageOptions: {
       globals: {
         // Node.js globals

@@ -21,8 +21,6 @@
     "verify": "npm run test && npm run check:js && npm run check:manifest",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
     "build": "node scripts/build.mjs",
     "setup:windows": "node scripts/windows-setup.mjs",
     "setup:windows:dry-run": "node scripts/windows-setup.mjs --dry-run --json",
@@ -37,7 +35,6 @@
   },
   "devDependencies": {
     "@eslint/js": "^9",
-    "eslint": "^9",
-    "prettier": "^3"
+    "eslint": "^9"
   }
 }

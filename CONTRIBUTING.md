@@ -6,8 +6,7 @@ Thanks for helping improve Hermes Browser Extension.
 
 - Use Node.js 20+.
 - Run `npm run verify` before opening a PR.
-- Run `npm run lint` and `npm run format:check` to catch style and syntax issues
-  early. Use `npm run format` to auto-fix formatting.
+- Run `npm run lint` for static checks when changing JavaScript.
 - Keep v0.1 read-only unless a proposal explicitly changes the permission model.
 - Load `dist/` unpacked for manual browser testing; do not load the repo root.
 
