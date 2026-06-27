@@ -164,11 +164,14 @@ const els = {
   agentPickerStatus: $('#agentPickerStatus'),
   themeGrid: $('#themeGrid'),
   colorModeButtons: Array.from(document.querySelectorAll('[data-color-mode]')),
+  tabPickerButton: $('#tabPickerButton'),
+  tabPickerCount: $('#tabPickerCount'),
   template: $('#messageTemplate'),
 };
 
 let settings = { ...DEFAULT_SETTINGS };
 let currentContext = { activeTab: null, tabs: [], pageContext: null };
+let selectedTabs = null; // null = all tabs; array of SafeTab = user-filtered set
 let messages = [];
 let availableModels = [];
 let availableSessions = [];
@@ -1815,6 +1818,116 @@ function renderSkillSuggestions() {
   els.skillMenu.hidden = false;
 }
 
+/* ── Tab picker ── */
+function renderTabPicker(filter = '') {
+  if (!els.tabPickerButton || !currentContext?.tabs) return;
+
+  // Create or find the dropdown container
+  let picker = document.getElementById('tabPicker');
+  if (!picker) {
+    picker = document.createElement('div');
+    picker.id = 'tabPicker';
+    picker.className = 'tab-picker';
+    picker.hidden = true;
+    els.tabPickerButton.parentNode.insertBefore(picker, els.tabPickerButton.nextSibling);
+  }
+
+  const tabs = currentContext.tabs;
+  const lowerFilter = String(filter || '').toLowerCase();
+  const filtered = lowerFilter
+    ? tabs.filter((t) => (t.title || '').toLowerCase().includes(lowerFilter) || (t.url || '').toLowerCase().includes(lowerFilter))
+    : tabs;
+
+  picker.innerHTML = '<input type="search" id="tabPickerSearch" class="tab-picker-search" placeholder="Filter tabs…" spellcheck="false">'
+    + '<div id="tabPickerList" class="tab-picker-list"></div>'
+    + '<div class="tab-picker-actions">'
+    + '<button id="tabPickerSelectAll">Select All</button>'
+    + '<button id="tabPickerDeselectAll">Deselect All</button>'
+    + '</div>';
+
+  const list = picker.querySelector('#tabPickerList');
+  for (const tab of filtered) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'tab-picker-item';
+    const isSelected = selectedTabs === null || selectedTabs.some((t) => t.tabId === tab.tabId);
+    if (isSelected) item.classList.add('selected');
+
+    const cb = document.createElement('span');
+    cb.className = 'tab-picker-checkbox';
+    cb.textContent = isSelected ? '✓' : '';
+
+    const info = document.createElement('span');
+    info.className = 'tab-picker-info';
+
+    const title = document.createElement('div');
+    title.className = 'tab-picker-title';
+    title.textContent = tab.title || 'untitled';
+
+    const url = document.createElement('div');
+    url.className = 'tab-picker-url';
+    url.textContent = tab.url || '';
+
+    info.append(title, url);
+    item.append(cb, info);
+    item.dataset.tabId = String(tab.tabId);
+
+    item.addEventListener('click', () => {
+      if (selectedTabs === null) {
+        // First toggle: start with all tabs selected, toggle this one off
+        selectedTabs = currentContext.tabs.filter((t) => t.tabId !== tab.tabId);
+      } else {
+        const exists = selectedTabs.some((t) => t.tabId === tab.tabId);
+        selectedTabs = exists
+          ? selectedTabs.filter((t) => t.tabId !== tab.tabId)
+          : [...selectedTabs, tab];
+        // If all tabs are now selected, reset to null
+        if (selectedTabs.length === tabs.length) selectedTabs = null;
+      }
+      // If nothing selected, reset back to null (all)
+      if (Array.isArray(selectedTabs) && selectedTabs.length === 0) selectedTabs = null;
+
+      renderTabPicker(filter);
+      updateTabPickerButton();
+    });
+
+    list.appendChild(item);
+  }
+
+  // Wire filter input
+  const searchInput = picker.querySelector('#tabPickerSearch');
+  if (searchInput) {
+    searchInput.value = filter;
+    searchInput.addEventListener('input', (e) => renderTabPicker(e.target.value));
+    searchInput.focus();
+  }
+
+  // Wire Select All
+  picker.querySelector('#tabPickerSelectAll')?.addEventListener('click', () => {
+    selectedTabs = null;
+    renderTabPicker(filter);
+    updateTabPickerButton();
+  });
+
+  // Wire Deselect All
+  picker.querySelector('#tabPickerDeselectAll')?.addEventListener('click', () => {
+    selectedTabs = [];
+    renderTabPicker(filter);
+    updateTabPickerButton();
+  });
+
+  picker.hidden = false;
+}
+
+function updateTabPickerButton() {
+  if (!els.tabPickerCount) return;
+  const count = selectedTabs === null ? (currentContext?.tabs?.length || 0) : selectedTabs.length;
+  els.tabPickerCount.textContent = String(count);
+  if (els.tabPickerButton) {
+    els.tabPickerButton.classList.toggle('active', selectedTabs !== null);
+  }
+}
+
 function renderProfiles() {
   if (!els.profileSelect) return;
   const selected = settings.activeProfile || availableProfiles.find((profile) => profile.active)?.name || '';
@@ -2787,6 +2900,7 @@ async function refreshContext() {
     setStatus('warn', tab.title || 'Page context partial', pageContext?.error || tab.url || '');
   }
   renderContextWindow();
+  updateTabPickerButton();
   return currentContext;
 }
 
@@ -3390,6 +3504,7 @@ async function askHermes(userText, turnAttachments = [...attachments]) {
       activeTab: context.activeTab,
       tabs: context.tabs,
       pageContext: context.pageContext,
+      selectedTabs,
       settings,
     });
 
@@ -3860,6 +3975,27 @@ function bindEvents() {
       els.composer.requestSubmit();
     });
   });
+
+  // Tab picker toggle
+  els.tabPickerButton?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const picker = document.getElementById('tabPicker');
+    if (picker && !picker.hidden) {
+      picker.hidden = true;
+    } else {
+      renderTabPicker('');
+    }
+  });
+
+  // Close tab picker on outside click
+  document.addEventListener('click', (event) => {
+    const picker = document.getElementById('tabPicker');
+    if (!picker || picker.hidden) return;
+    if (!event.target.closest('#tabPicker, #tabPickerButton')) {
+      picker.hidden = true;
+    }
+  });
+
   chrome.tabs?.onActivated?.addListener?.(() => refreshContext());
   chrome.tabs?.onUpdated?.addListener?.((_tabId, changeInfo) => {
     if (changeInfo.status === 'complete' || changeInfo.title || changeInfo.url) refreshContext();
