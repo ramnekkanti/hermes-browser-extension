@@ -555,8 +555,8 @@ export function composerControlState({ connected = false, sending = false, draft
       },
     },
     mainButton: {
-      disabled: !connected && !sending,
-      label: sending ? 'Queue message' : 'Ask Hermes',
+      disabled: !connected || Boolean(sending),
+      label: sending ? 'Hermes running' : 'Ask Hermes',
     },
   };
 }

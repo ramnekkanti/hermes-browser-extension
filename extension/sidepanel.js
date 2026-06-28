@@ -899,7 +899,7 @@ function updateConnectionPrompt() {
       }
     }
   } else {
-    els.sendButton.textContent = sending ? 'Queue message' : 'Ask Hermes';
+    els.sendButton.textContent = sending ? 'Hermes running' : 'Ask Hermes';
   }
   updateComposerBusyState();
 }
@@ -935,6 +935,7 @@ function updateComposerBusyState() {
   setComposerButtonState(els.queueButton, state.controls.queue);
   setComposerButtonState(els.steerButton, state.controls.steer);
   els.composerDropZone?.classList.toggle('busy-draft', state.busyDraft);
+  els.composerDropZone?.classList.toggle('can-steer', state.busyDraft && !state.controls.steer.hidden);
   if (els.sendButton) {
     els.sendButton.disabled = state.mainButton.disabled;
     if (isConnected()) els.sendButton.textContent = state.mainButton.label;
@@ -2215,7 +2216,7 @@ function applySelectedModel(selectedId, { persist = true, keepOpen = false } = {
   }
 }
 
-async function loadModels({ quiet = false, payload = null } = {}) {
+async function loadModels({ quiet = false, payload = null, refresh = false } = {}) {
   try {
     let data = payload;
     let registryModels = [];
@@ -2236,7 +2237,7 @@ async function loadModels({ quiet = false, payload = null } = {}) {
     if (data) {
       registryModels = normalizeHermesModels(data, settings.model);
     } else {
-      const registryResult = await discoverModelsFromRegistry({ apiFetch, readJsonResponse });
+      const registryResult = await discoverModelsFromRegistry({ apiFetch, readJsonResponse, refresh });
       if (registryResult.ok && registryResult.models.length) {
         registryModels = normalizeHermesModels(registryResult.models, settings.model);
         registrySource = 'registry';
@@ -2252,10 +2253,12 @@ async function loadModels({ quiet = false, payload = null } = {}) {
       }
     }
 
-    // If the gateway only exposes the OpenAI-compatible virtual alias, keep a
+    // If the gateway only exposes a single OpenAI-compatible row, keep a
     // best-effort session-history fallback. The durable source is
-    // /api/model/options; sessions are only for older gateways.
-    if (registryModels.length <= 1 && registryModels[0]?.id === DEFAULT_SETTINGS.model) {
+    // /api/model/options; sessions are only for older API-server gateways.
+    const shouldTrySessionFallback = registryModels.length <= 1
+      && (registrySource === 'v1' || registryModels[0]?.id === DEFAULT_SETTINGS.model);
+    if (shouldTrySessionFallback) {
       const sessionResult = await discoverModelsFromSessions({ apiFetch, readJsonResponse });
       if (sessionResult.ok && sessionResult.models.length) {
         const merged = mergeModelsWithRegistry({ registryModels, sessionModels: sessionResult.models });
@@ -2271,7 +2274,7 @@ async function loadModels({ quiet = false, payload = null } = {}) {
           }
         }
       } else if (!sessionResult.ok && !quiet) {
-        setStatus('warn', 'Model discovery limited', `Gateway exposes only the synthetic 'hermes-agent' alias and /api/sessions was unavailable (${sessionResult.error}).`);
+        setStatus('warn', 'Model discovery limited', `Gateway exposes only one /v1/models row and /api/sessions was unavailable (${sessionResult.error}).`);
       }
     }
 
@@ -4194,7 +4197,7 @@ async function testConnection() {
     const modelsResponse = await apiFetch('/v1/models', { method: 'GET' });
     const modelsPayload = await readJsonResponse(modelsResponse);
     if (!modelsResponse.ok) throw new Error(`Health OK, auth/model probe failed (${modelsResponse.status}): ${JSON.stringify(modelsPayload).slice(0, 500)}`);
-    await loadModels({ quiet: true, payload: modelsPayload });
+    await loadModels({ quiet: true });
     await loadSkills({ quiet: true });
     await loadProfiles({ quiet: true });
 
@@ -4323,7 +4326,7 @@ function bindEvents() {
   });
   els.voiceButton?.addEventListener('click', toggleVoiceDictation);
   els.checkUpdatesButton?.addEventListener('click', checkForUpdates);
-  els.refreshModelsButton.addEventListener('click', () => loadModels());
+  els.refreshModelsButton.addEventListener('click', () => loadModels({ refresh: true }));
   els.refreshProfilesButton?.addEventListener('click', () => loadProfiles());
   els.profileSelect?.addEventListener('change', () => applySelectedProfile(els.profileSelect.value));
   els.refreshAgentsButton?.addEventListener('click', () => loadAgents());

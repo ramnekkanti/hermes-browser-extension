@@ -1230,14 +1230,17 @@ button:disabled { cursor: wait; opacity: 0.55; transform: none; }
 .composer-icon[hidden] { display: none; }
 .composer-icon:disabled { cursor: not-allowed; opacity: 0.42; }
 .composer-mic { right: 38px; }
-.composer-input-wrap.busy-draft .composer-mic { right: 96px; }
+.composer-input-wrap.busy-draft .composer-mic { display: none; }
 .composer-mic.recording { color: var(--danger); border-color: var(--danger); }
 .composer-send { right: 9px; }
 .composer-send svg { transform: translateY(-1px); }
 .composer-stop { right: 9px; color: var(--danger); border-color: var(--danger); font-size: 11px; }
-.composer-input-wrap.busy-draft .composer-stop { right: 67px; }
+.composer-input-wrap.busy-draft .composer-stop { right: 38px; }
 .composer-stop:not([hidden]) { display: inline-flex; }
 .composer-queue { right: 38px; }
+.composer-input-wrap.busy-draft .composer-queue { right: 9px; }
+.composer-input-wrap.busy-draft.can-steer .composer-stop { right: 67px; }
+.composer-input-wrap.busy-draft.can-steer .composer-queue { right: 38px; }
 .composer-steer { right: 9px; color: var(--hermes-accent); border-color: rgba(var(--hermes-accent-rgb),0.48); }
 .composer-queue svg,
 .composer-steer svg { transform: translateY(-1px); }
@@ -1353,7 +1356,7 @@ textarea, input, select {
   outline: none;
 }
 textarea { resize: vertical; min-height: 76px; max-height: 28vh; padding: 10px 68px 34px 36px; line-height: 1.35; }
-.composer-input-wrap.busy-draft textarea { padding-right: 128px; }
+.composer-input-wrap.busy-draft.can-steer textarea { padding-right: 98px; }
 input, select { padding: 9px; margin-top: 6px; }
 textarea::placeholder, input::placeholder { color: rgba(var(--hermes-ink-rgb),0.48); }
 textarea:focus, input:focus, select:focus { border-color: var(--hermes-accent); box-shadow: 0 0 0 2px var(--hermes-accent); }

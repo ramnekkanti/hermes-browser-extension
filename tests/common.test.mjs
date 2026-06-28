@@ -300,7 +300,7 @@ test('composer renders Desktop-style queue and steer controls for busy drafts', 
   assert.notEqual(stopIndex, -1);
   assert.notEqual(queueIndex, -1);
   assert.notEqual(steerIndex, -1);
-  assert.ok(stopIndex > voiceIndex, 'stop should sit next to mic while a run is active');
+  assert.ok(stopIndex > voiceIndex, 'stop should render after the idle mic control');
   assert.ok(queueIndex > stopIndex, 'queue should render after stop in the composer icon cluster');
   assert.ok(steerIndex > queueIndex, 'steer should render immediately after queue');
   assert.match(html.slice(queueIndex, queueIndex + 500), /aria-label="Queue message"/);
@@ -335,6 +335,8 @@ test('composer busy controls reveal queue and steer only when the user is drafti
   assert.equal(busyDraft.controls.steer.hidden, false);
   assert.equal(busyDraft.controls.queue.label, 'Queue message');
   assert.equal(busyDraft.controls.steer.label, 'Steer the current run');
+  assert.equal(busyDraft.mainButton.disabled, true);
+  assert.equal(busyDraft.mainButton.label, 'Hermes running');
 
   const busyDraftWithoutSteer = composerControlState({ connected: true, sending: true, draftText: 'tighten this answer', canSteer: false });
   assert.equal(busyDraftWithoutSteer.busyDraft, true);
@@ -364,6 +366,16 @@ test('queued message controls allow delete anytime and steer only when runnable 
   assert.equal(queuedMessageControlState({ sending: true, text: 'later', canSteer: false }).steer.hidden, true);
   assert.equal(queuedMessageControlState({ sending: true, text: 'later', canSteer: false }).delete.disabled, false);
   assert.equal(queuedMessageControlState({ sending: true, text: '   ' }).delete.disabled, false);
+});
+
+test('busy composer hides mic and uses compact queue/steer icon spacing', () => {
+  const css = readFileSync(new URL('../extension/sidepanel.css', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(css, /\.composer-input-wrap\.busy-draft \.composer-mic \{ display: none; \}/);
+  assert.match(css, /\.composer-input-wrap\.busy-draft \.composer-queue \{ right: 9px; \}/);
+  assert.match(css, /\.composer-input-wrap\.busy-draft\.can-steer \.composer-stop \{ right: 67px; \}/);
+  assert.match(css, /\.composer-input-wrap\.busy-draft\.can-steer textarea \{ padding-right: 98px; \}/);
+  assert.match(source, /classList\.toggle\('can-steer', state\.busyDraft && !state\.controls\.steer\.hidden\)/);
 });
 
 test('voice dictation targets the Desktop-compatible Hermes audio transcription API', () => {
@@ -421,9 +433,12 @@ test('connect and startup sync Hermes models, sessions, skills, and profiles fro
   const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
   assert.match(source, /await loadModels\(\{ quiet: true \}\);\s*await loadSkills\(\{ quiet: true \}\);\s*await loadProfiles\(\{ quiet: true \}\);\s*await loadSessions\(\{ quiet: true \}\);\s*await ensureDefaultBrowserSession\(\{ focus: false \}\);/s);
   assert.match(source, /apiFetch\('\/v1\/models'/);
+  assert.doesNotMatch(source, /loadModels\(\{ quiet: true, payload: modelsPayload \}\)/);
+  assert.match(source, /const shouldTrySessionFallback = registryModels\.length <= 1\s*&& \(registrySource === 'v1' \|\| registryModels\[0\]\?\.id === DEFAULT_SETTINGS\.model\);/);
   assert.match(source, /apiFetch\('\/v1\/skills'/);
   assert.match(source, /apiFetch\('\/v1\/profiles'/);
   assert.match(source, /apiFetch\(`\/api\/sessions\?limit=\$\{limit\}&offset=\$\{offset\}&include_children=true&order=recent`/);
+  assert.match(source, /els\.refreshModelsButton\.addEventListener\('click', \(\) => loadModels\(\{ refresh: true \}\)\)/);
 });
 
 test('renderMarkdown produces safe rich text for headings, lists, tables, and links', () => {
@@ -790,6 +805,35 @@ test('discoverModelsFromRegistry flattens /api/model/options provider inventory'
   assert.equal(result.models[0].fast, true);
   assert.equal(result.models[0].runtimeSelectable, true);
   assert.equal(result.models[2].contextTokens, 1000000);
+});
+
+test('discoverModelsFromRegistry picks up context_length from capabilities when model entries are bare strings', async () => {
+  const { discoverModelsFromRegistry } = await import('../extension/lib/model-discovery.mjs');
+  const apiFetch = async () => ({ ok: true, status: 200 });
+  const readJsonResponse = async () => ({
+    providers: [
+      {
+        slug: 'nous',
+        name: 'Nous Portal',
+        authenticated: true,
+        models: ['xiaomi/mimo-v2.5-pro', 'anthropic/claude-sonnet-4'],
+        capabilities: {
+          'xiaomi/mimo-v2.5-pro': { fast: false, reasoning: true, context_length: 1048576 },
+          'anthropic/claude-sonnet-4': { fast: true, reasoning: true, context_length: 200000 },
+        },
+      },
+    ],
+    model: 'xiaomi/mimo-v2.5-pro',
+    provider: 'nous',
+  });
+
+  const result = await discoverModelsFromRegistry({ apiFetch, readJsonResponse });
+  assert.equal(result.ok, true);
+  assert.equal(result.models.length, 2);
+  assert.equal(result.models[0].contextTokens, 1048576);
+  assert.equal(result.models[1].contextTokens, 200000);
+  assert.equal(result.models[0].reasoning, true);
+  assert.equal(result.models[0].fast, false);
 });
 
 test('normalizeHermesModels preserves camelCase registry labels for grouping', () => {
