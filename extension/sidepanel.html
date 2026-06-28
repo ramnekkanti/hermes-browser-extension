@@ -100,7 +100,14 @@
             <span id="contextChipLabel">📎 Loading...</span>
             <strong>preview</strong>
           </button>
+          <button id="contextScopeButton" class="context-scope-button" type="button" aria-haspopup="dialog" aria-expanded="false" title="Choose which tab Hermes reads">
+            <span id="contextScopeLabel">Follow active tab</span>
+          </button>
+          <button id="tabPickerButton" class="tab-picker-btn" type="button" title="Select tabs to list in the prompt" aria-label="Select prompt tabs">
+            <span class="tab-picker-btn-icon">📑</span><span id="tabPickerCount" class="tab-picker-badge">0</span>
+          </button>
           <div id="contextPreview" class="context-preview" hidden></div>
+          <div id="contextScopeMenu" class="context-scope-menu" hidden></div>
           <div class="composer-input-wrap" id="composerDropZone">
             <textarea id="promptInput" rows="3" placeholder="Ask Hermes about this page..."></textarea>
             <div id="dropOverlay" class="drop-overlay" hidden>Drop files to attach</div>

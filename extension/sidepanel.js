@@ -73,6 +73,17 @@ import {
   parseCommandInput,
   resolveCommandPrompt,
 } from './lib/commands.mjs';
+import {
+  CONTEXT_SCOPE_MODES,
+  DEFAULT_CONTEXT_SCOPE,
+  contextScopeFromTab,
+  filterPromptTabs,
+  messageStorageKeyForScope,
+  normalizeContextScope,
+  resolveContextTargetTab,
+  sessionBindingKeyForScope,
+  shouldRefreshForTabEvent,
+} from './lib/context-scope.mjs';
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -97,6 +108,9 @@ const els = {
   contextChip: $('#contextChip'),
   contextChipLabel: $('#contextChipLabel'),
   contextPreview: $('#contextPreview'),
+  contextScopeButton: $('#contextScopeButton'),
+  contextScopeLabel: $('#contextScopeLabel'),
+  contextScopeMenu: $('#contextScopeMenu'),
   composerDropZone: $('#composerDropZone'),
   dropOverlay: $('#dropOverlay'),
   skillMenu: $('#skillMenu'),
@@ -171,11 +185,15 @@ const els = {
   colorModeButtons: Array.from(document.querySelectorAll('[data-color-mode]')),
   quickMoreMenu: $('#quickMoreMenu'),
   quickActionsScroll: $('#quickActionsScroll'),
+  tabPickerButton: $('#tabPickerButton'),
+  tabPickerCount: $('#tabPickerCount'),
   template: $('#messageTemplate'),
 };
 
 let settings = { ...DEFAULT_SETTINGS };
-let currentContext = { activeTab: null, tabs: [], pageContext: null };
+let contextScope = normalizeContextScope(DEFAULT_CONTEXT_SCOPE);
+let currentContext = { activeTab: null, tabs: [], pageContext: null, contextScope };
+let selectedTabs = null; // null = all tabs; array of SafeTab = user-filtered set
 let messages = [];
 let availableModels = [];
 let availableSessions = [];
@@ -350,6 +368,201 @@ function renderConnectionSecurity() {
     els.connectionSecuritySummary.appendChild(row);
   }
   if (els.clearTokenButton) els.clearTokenButton.disabled = !summary.hasToken;
+}
+
+function ensureSidepanelInstanceId() {
+  try {
+    let id = globalThis.sessionStorage?.getItem('hermesBrowserInstanceId');
+    if (!id) {
+      id = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      globalThis.sessionStorage?.setItem('hermesBrowserInstanceId', id);
+    }
+    return id;
+  } catch {
+    return 'default';
+  }
+}
+
+function contextScopeSessionKey() {
+  return `hermesBrowserContextScope:${ensureSidepanelInstanceId()}`;
+}
+
+function loadContextScopeForInstance() {
+  try {
+    contextScope = normalizeContextScope(JSON.parse(globalThis.sessionStorage?.getItem(contextScopeSessionKey()) || '{}'));
+  } catch {
+    contextScope = normalizeContextScope(DEFAULT_CONTEXT_SCOPE);
+  }
+  return contextScope;
+}
+
+function saveContextScopeForInstance() {
+  try {
+    globalThis.sessionStorage?.setItem(contextScopeSessionKey(), JSON.stringify(contextScope));
+  } catch {
+    // Per-panel scope persistence is best-effort only.
+  }
+}
+
+function activeMessagesStorageKey() {
+  return contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB
+    ? messageStorageKeyForScope(contextScope)
+    : 'hermesBrowserMessages';
+}
+
+async function loadMessagesForActiveScope() {
+  const key = activeMessagesStorageKey();
+  const stored = await chrome.storage.local.get([key]);
+  messages = Array.isArray(stored[key]) ? stored[key] : [];
+  renderMessagesFromStorage();
+}
+
+async function saveMessagesForActiveScope() {
+  const key = activeMessagesStorageKey();
+  await chrome.storage.local.set({ [key]: messages });
+}
+
+async function loadSessionBindingForActiveScope() {
+  if (contextScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB) return null;
+  const key = sessionBindingKeyForScope(contextScope);
+  const stored = await chrome.storage.local.get([key]);
+  return stored[key] || null;
+}
+
+async function saveSessionBindingForActiveScope(session) {
+  if (contextScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB || !session?.id) return;
+  const key = sessionBindingKeyForScope(contextScope);
+  await chrome.storage.local.set({
+    [key]: {
+      sessionId: session.id,
+      sessionTitle: session.title || session.id,
+      pinnedTabId: contextScope.pinnedTabId,
+      pinnedTitle: contextScope.pinnedTitle || '',
+      pinnedUrl: contextScope.pinnedUrl || '',
+      updatedAt: Date.now(),
+    },
+  });
+}
+
+function syncSelectedTabsFromContextScope(tabs = currentContext.tabs || []) {
+  if (!Array.isArray(contextScope.selectedTabIds)) {
+    selectedTabs = null;
+    return;
+  }
+  const ids = new Set(contextScope.selectedTabIds.map(Number));
+  selectedTabs = tabs.filter((tab) => ids.has(Number(tab.id)));
+}
+
+function syncSelectedTabsToContextScope() {
+  contextScope = normalizeContextScope({
+    ...contextScope,
+    selectedTabIds: Array.isArray(selectedTabs)
+      ? selectedTabs.map((tab) => Number(tab.id)).filter(Number.isFinite)
+      : null,
+  });
+  saveContextScopeForInstance();
+}
+
+function contextScopeLabel() {
+  if (contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB) {
+    return contextScope.pinnedTitle ? `Pinned: ${contextScope.pinnedTitle}` : 'Pinned tab';
+  }
+  return 'Follow active tab';
+}
+
+function renderContextScopeControls() {
+  if (!els.contextScopeButton || !els.contextScopeLabel) return;
+  const pinned = contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB;
+  els.contextScopeLabel.textContent = contextScopeLabel();
+  els.contextScopeButton.classList.toggle('active', pinned);
+  els.contextScopeButton.setAttribute('aria-expanded', String(!els.contextScopeMenu?.hidden));
+  els.contextScopeButton.title = pinned
+    ? `Hermes is pinned to ${contextScope.pinnedUrl || contextScope.pinnedTitle || 'this tab'}`
+    : 'Hermes follows the active browser tab';
+}
+
+function appendContextScopeMenuButton({ action, label, detail = '', selected = false }) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.dataset.scopeAction = action;
+  if (selected) button.classList.add('selected');
+  const text = document.createElement('span');
+  text.textContent = label;
+  const meta = document.createElement('small');
+  meta.textContent = selected ? '✓' : detail;
+  button.append(text, meta);
+  els.contextScopeMenu.appendChild(button);
+}
+
+function renderContextScopeMenu() {
+  if (!els.contextScopeMenu) return;
+  els.contextScopeMenu.innerHTML = '';
+  appendContextScopeMenuButton({
+    action: 'follow-active',
+    label: 'Follow active tab',
+    detail: 'live',
+    selected: contextScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB,
+  });
+  appendContextScopeMenuButton({ action: 'pin-active', label: 'Pin current tab', detail: 'lock' });
+  if (contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB) {
+    appendContextScopeMenuButton({ action: 'unlock', label: 'Unlock pinned tab', detail: 'follow' });
+  }
+  const tabs = currentContext.tabs || [];
+  if (tabs.length) {
+    for (const tab of tabs.slice(0, 20)) {
+      appendContextScopeMenuButton({
+        action: `pin-tab:${tab.id}`,
+        label: `Pin: ${tab.title || tab.url || 'Untitled tab'}`,
+        detail: Number(tab.id) === Number(contextScope.pinnedTabId) ? 'current' : '',
+        selected: contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB && Number(tab.id) === Number(contextScope.pinnedTabId),
+      });
+    }
+  }
+  els.contextScopeMenu.hidden = false;
+  renderContextScopeControls();
+}
+
+function makePinnedTabSessionTitle(tab = {}) {
+  const title = String(tab.title || tab.pinnedTitle || tab.url || tab.pinnedUrl || '').trim() || 'Pinned browser tab';
+  return `Hermes Browser Extension · ${title.slice(0, 80)}`;
+}
+
+async function ensureSessionForActiveScope({ focus = false } = {}) {
+  if (contextScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB) {
+    await ensureDefaultBrowserSession({ focus });
+    return;
+  }
+  if (!settings.apiKey || !isConnected()) return;
+  const binding = await loadSessionBindingForActiveScope();
+  if (binding?.sessionId) {
+    const session = availableSessions.find((item) => item.id === binding.sessionId) || {
+      id: binding.sessionId,
+      title: binding.sessionTitle || binding.sessionId,
+      source: DEFAULT_SETTINGS.sessionSource,
+    };
+    await openHermesSession(session);
+    return;
+  }
+  await createHermesBrowserSession({ title: makePinnedTabSessionTitle(currentContext.activeTab || contextScope), focus });
+}
+
+async function applyContextScope(nextScope, { ensureSession = false } = {}) {
+  contextScope = normalizeContextScope(nextScope);
+  saveContextScopeForInstance();
+  syncSelectedTabsFromContextScope(currentContext.tabs || []);
+  renderContextScopeControls();
+  await loadMessagesForActiveScope();
+  if (ensureSession) await ensureSessionForActiveScope({ focus: false });
+  await refreshContext();
+}
+
+async function pinContextTab(tab) {
+  if (!tab?.id) return;
+  await applyContextScope(contextScopeFromTab(tab, contextScope), { ensureSession: true });
+}
+
+async function unlockContextScope() {
+  await applyContextScope({ ...contextScope, mode: CONTEXT_SCOPE_MODES.FOLLOW_ACTIVE, pinnedTabId: null, pinnedWindowId: null, pinnedTitle: '', pinnedUrl: '' });
 }
 
 function setGatewayCapabilities(caps) {
@@ -1893,6 +2106,110 @@ function renderQuickMoreMenu(category = 'all') {
   els.quickMoreMenu.hidden = false;
 }
 
+/* ── Tab picker ── */
+function renderTabPicker(filter = '') {
+  if (!els.tabPickerButton || !currentContext?.tabs) return;
+
+  let picker = document.getElementById('tabPicker');
+  if (!picker) {
+    picker = document.createElement('div');
+    picker.id = 'tabPicker';
+    picker.className = 'tab-picker';
+    picker.hidden = true;
+    els.tabPickerButton.parentNode.insertBefore(picker, els.tabPickerButton.nextSibling);
+  }
+
+  const tabs = currentContext.tabs;
+  const lowerFilter = String(filter || '').toLowerCase();
+  const filtered = lowerFilter
+    ? tabs.filter((tab) => (tab.title || '').toLowerCase().includes(lowerFilter) || (tab.url || '').toLowerCase().includes(lowerFilter))
+    : tabs;
+
+  picker.innerHTML = `<input type="search" id="tabPickerSearch" class="tab-picker-search" placeholder="Filter tabs…" spellcheck="false">
+    <div id="tabPickerList" class="tab-picker-list"></div>
+    <div class="tab-picker-actions">
+      <button id="tabPickerSelectAll" type="button">Select All</button>
+      <button id="tabPickerDeselectAll" type="button">Deselect All</button>
+    </div>`;
+
+  const list = picker.querySelector('#tabPickerList');
+  for (const tab of filtered) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'tab-picker-item';
+    const isSelected = selectedTabs === null || selectedTabs.some((candidate) => candidate.id === tab.id);
+    if (isSelected) item.classList.add('selected');
+
+    const checkbox = document.createElement('span');
+    checkbox.className = 'tab-picker-checkbox';
+    checkbox.textContent = isSelected ? '✓' : '';
+
+    const info = document.createElement('span');
+    info.className = 'tab-picker-info';
+
+    const title = document.createElement('div');
+    title.className = 'tab-picker-title';
+    title.textContent = tab.title || 'untitled';
+
+    const url = document.createElement('div');
+    url.className = 'tab-picker-url';
+    url.textContent = tab.url || '';
+
+    info.append(title, url);
+    item.append(checkbox, info);
+    item.dataset.tabId = String(tab.id);
+
+    item.addEventListener('click', () => {
+      if (selectedTabs === null) {
+        selectedTabs = currentContext.tabs.filter((candidate) => candidate.id !== tab.id);
+      } else {
+        const exists = selectedTabs.some((candidate) => candidate.id === tab.id);
+        selectedTabs = exists
+          ? selectedTabs.filter((candidate) => candidate.id !== tab.id)
+          : [...selectedTabs, tab];
+        if (selectedTabs.length === tabs.length) selectedTabs = null;
+      }
+      renderTabPicker(filter);
+      updateTabPickerButton();
+      syncSelectedTabsToContextScope();
+    });
+
+    list.appendChild(item);
+  }
+
+  const searchInput = picker.querySelector('#tabPickerSearch');
+  if (searchInput) {
+    searchInput.value = filter;
+    searchInput.addEventListener('input', (event) => renderTabPicker(event.target.value));
+    searchInput.focus();
+  }
+
+  picker.querySelector('#tabPickerSelectAll')?.addEventListener('click', () => {
+    selectedTabs = null;
+    renderTabPicker(filter);
+    updateTabPickerButton();
+    syncSelectedTabsToContextScope();
+  });
+
+  picker.querySelector('#tabPickerDeselectAll')?.addEventListener('click', () => {
+    selectedTabs = [];
+    renderTabPicker(filter);
+    updateTabPickerButton();
+    syncSelectedTabsToContextScope();
+  });
+
+  picker.hidden = false;
+}
+
+function updateTabPickerButton() {
+  if (!els.tabPickerCount) return;
+  const count = selectedTabs === null ? (currentContext?.tabs?.length || 0) : selectedTabs.length;
+  els.tabPickerCount.textContent = String(count);
+  if (els.tabPickerButton) {
+    els.tabPickerButton.classList.toggle('active', selectedTabs !== null);
+  }
+}
+
 function renderProfiles() {
   if (!els.profileSelect) return;
   const selected = settings.activeProfile || availableProfiles.find((profile) => profile.active)?.name || '';
@@ -2321,7 +2638,8 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
     availableSessions = normalizeHermesSessions({ sessions: [session, ...availableSessions.filter((item) => item.id !== id)] });
     settings = { ...settings, sessionId: id, sessionTitle: session.title || title };
     messages = [];
-    await chrome.storage.local.set({ hermesBrowserSettings: settings, hermesBrowserMessages: [] });
+    await chrome.storage.local.set({ hermesBrowserSettings: settings, [activeMessagesStorageKey()]: [] });
+    await saveSessionBindingForActiveScope(session);
     renderMessagesFromStorage();
     updateSessionLabel();
     renderSessionMenu();
@@ -2347,7 +2665,8 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
   settings = { ...settings, sessionId: session.id, sessionTitle: session.title || title };
   sessionRoutesAvailable = true;
   messages = [];
-  await chrome.storage.local.set({ hermesBrowserSettings: settings, hermesBrowserMessages: [] });
+  await chrome.storage.local.set({ hermesBrowserSettings: settings, [activeMessagesStorageKey()]: [] });
+  await saveSessionBindingForActiveScope(session);
   renderMessagesFromStorage();
   updateSessionLabel();
   renderSessionMenu();
@@ -2371,6 +2690,7 @@ async function openHermesSession(session) {
   settings = { ...settings, sessionId: session.id, sessionTitle: session.title || session.id };
   sessionRoutesAvailable = true;
   await chrome.storage.local.set({ hermesBrowserSettings: settings });
+  await saveSessionBindingForActiveScope(session);
   updateSessionLabel();
   renderSessionMenu();
   await loadSessionMessages(session.id);
@@ -2388,7 +2708,7 @@ async function loadSessionMessages(sessionId = settings.sessionId) {
         .map((message) => ({ role: message.role, content: coerceWsMessageContent(message.content), ts: Number(message.timestamp || message.ts || Date.now()) }))
         .filter((message) => message.content)
         .slice(-settings.maxLocalMessages);
-      await chrome.storage.local.set({ hermesBrowserMessages: messages });
+      await chrome.storage.local.set({ [activeMessagesStorageKey()]: messages });
       renderMessagesFromStorage();
     } catch (error) {
       addMessage('system', `Could not load session messages: ${error?.message || String(error)}`);
@@ -2405,7 +2725,7 @@ async function loadSessionMessages(sessionId = settings.sessionId) {
       .filter((message) => ['user', 'assistant', 'system'].includes(message.role) && message.content)
       .map((message) => ({ role: message.role, content: String(message.content), ts: Number(message.timestamp || Date.now()) }))
       .slice(-settings.maxLocalMessages);
-    await chrome.storage.local.set({ hermesBrowserMessages: messages });
+    await chrome.storage.local.set({ [activeMessagesStorageKey()]: messages });
     renderMessagesFromStorage();
   } catch (error) {
     addMessage('system', `Could not load session messages: ${error?.message || String(error)}`);
@@ -2519,11 +2839,13 @@ function createStreamingMessageUpdater(node) {
 async function trimAndSaveMessages() {
   const max = Number(settings.maxLocalMessages || DEFAULT_SETTINGS.maxLocalMessages);
   if (messages.length > max) messages = messages.slice(-max);
-  await chrome.storage.local.set({ hermesBrowserMessages: messages });
+  await saveMessagesForActiveScope();
 }
 
 async function loadSettings() {
-  const stored = await chrome.storage.local.get(['hermesBrowserSettings', 'hermesBrowserMessages']);
+  loadContextScopeForInstance();
+  const messageKey = activeMessagesStorageKey();
+  const stored = await chrome.storage.local.get(['hermesBrowserSettings', messageKey]);
   const storedSettings = stored.hermesBrowserSettings || {};
   const migrateDesktopOptionDefaults = !storedSettings.modelOptionsVersion && storedSettings.reasoningEffort === 'medium';
   settings = { ...DEFAULT_SETTINGS, ...storedSettings };
@@ -2545,7 +2867,7 @@ async function loadSettings() {
   if (migrateDesktopOptionDefaults) {
     await chrome.storage.local.set({ hermesBrowserSettings: settings });
   }
-  messages = Array.isArray(stored.hermesBrowserMessages) ? stored.hermesBrowserMessages : [];
+  messages = Array.isArray(stored[messageKey]) ? stored[messageKey] : [];
   syncSettingsForm();
   renderMessagesFromStorage();
 }
@@ -2646,6 +2968,18 @@ async function activeTab() {
 async function currentWindowTabs() {
   const tabs = await chrome.tabs.query({ currentWindow: true });
   return tabs.map(safeTab);
+}
+
+async function tabsForCurrentScope() {
+  const tabs = await currentWindowTabs();
+  if (contextScope.mode !== CONTEXT_SCOPE_MODES.PINNED_TAB || contextScope.pinnedTabId === null) return tabs;
+  if (tabs.some((tab) => Number(tab.id) === Number(contextScope.pinnedTabId))) return tabs;
+  try {
+    const pinned = await chrome.tabs.get(Number(contextScope.pinnedTabId));
+    return [safeTab(pinned), ...tabs.filter((tab) => Number(tab.id) !== Number(contextScope.pinnedTabId))];
+  } catch {
+    return tabs;
+  }
 }
 
 async function ensureContentScript(tabId) {
@@ -2849,13 +3183,22 @@ async function getYoutubeTranscriptForTab(tab) {
 }
 
 async function refreshContext() {
-  const [tab, tabs] = await Promise.all([activeTab(), currentWindowTabs()]);
-  const pageContext = tab ? await getPageContext(tab) : null;
+  const [active, tabs] = await Promise.all([activeTab(), tabsForCurrentScope()]);
+  const tab = resolveContextTargetTab({ activeTab: active, tabs, scope: contextScope });
+  const pinnedMissing = contextScope.mode === CONTEXT_SCOPE_MODES.PINNED_TAB && !tab;
+  const pageContext = tab
+    ? await getPageContext(tab)
+    : pinnedMissing
+      ? { ok: false, restricted: true, reason: 'Pinned tab is closed or no longer available.', text: '', selectedText: '', meta: {} }
+      : null;
   const youtubeTranscript = tab ? await getYoutubeTranscriptForTab(tab) : null;
   if (pageContext && youtubeTranscript) pageContext.youtubeTranscript = youtubeTranscript;
-  currentContext = { activeTab: tab, tabs, pageContext };
+  currentContext = { activeTab: tab, tabs, pageContext, contextScope };
+  syncSelectedTabsFromContextScope(tabs);
 
-  if (!tab) {
+  if (pinnedMissing) {
+    setStatus('warn', 'Pinned tab closed', 'Choose another tab or follow the active tab.');
+  } else if (!tab) {
     setStatus('warn', 'No active tab detected', 'Open a normal browser tab and try again.');
   } else if (pageContext?.restricted) {
     setStatus('warn', tab.title || 'Restricted page', `${tab.url} - context restricted`);
@@ -2864,7 +3207,9 @@ async function refreshContext() {
   } else {
     setStatus('warn', tab.title || 'Page context partial', pageContext?.error || tab.url || '');
   }
+  renderContextScopeControls();
   renderContextWindow();
+  updateTabPickerButton();
   return currentContext;
 }
 
@@ -3477,11 +3822,15 @@ async function askHermes(userText, turnAttachments = [...attachments]) {
     const displayUserText = preparedAttachments.length
       ? `${userText || 'Attachment-only turn.'}\n${preparedAttachments.map((attachment) => `${attachmentIcon(attachment.kind)} ${attachment.label}`).join('\n')}`
       : userText;
+    const promptTabs = filterPromptTabs(context.tabs, contextScope);
+    const selectedPromptTabs = Array.isArray(contextScope.selectedTabIds) ? promptTabs : undefined;
     const prompt = buildHermesPrompt({
       userText: promptUserText,
       activeTab: context.activeTab,
       tabs: context.tabs,
       pageContext: context.pageContext,
+      selectedTabs: selectedPromptTabs,
+      contextScope,
       settings,
     });
 
@@ -3953,6 +4302,36 @@ function bindEvents() {
     });
   });
 
+  els.contextScopeButton?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (!els.contextScopeMenu) return;
+    if (!els.contextScopeMenu.hidden) {
+      els.contextScopeMenu.hidden = true;
+      renderContextScopeControls();
+      return;
+    }
+    renderContextScopeMenu();
+  });
+  els.contextScopeMenu?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-scope-action]');
+    if (!button) return;
+    const action = button.dataset.scopeAction || '';
+    els.contextScopeMenu.hidden = true;
+    if (action === 'follow-active' || action === 'unlock') {
+      unlockContextScope().catch((error) => setStatus('warn', 'Could not unlock tab scope', error?.message || String(error)));
+      return;
+    }
+    if (action === 'pin-active') {
+      activeTab().then(pinContextTab).catch((error) => setStatus('warn', 'Could not pin active tab', error?.message || String(error)));
+      return;
+    }
+    if (action.startsWith('pin-tab:')) {
+      const tabId = Number(action.slice('pin-tab:'.length));
+      const tab = currentContext.tabs.find((item) => Number(item.id) === tabId);
+      pinContextTab(tab).catch((error) => setStatus('warn', 'Could not pin tab', error?.message || String(error)));
+    }
+  });
+
   // Wire built-in quick-command buttons (data-command)
   document.querySelectorAll('[data-command]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -3977,13 +4356,39 @@ function bindEvents() {
     });
   }
 
-  // Close overflow menu on outside click
-  document.addEventListener('click', () => {
-    if (els.quickMoreMenu && !els.quickMoreMenu.hidden) els.quickMoreMenu.hidden = true;
+  // Tab picker toggle
+  els.tabPickerButton?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const picker = document.getElementById('tabPicker');
+    if (picker && !picker.hidden) {
+      picker.hidden = true;
+    } else {
+      renderTabPicker('');
+    }
   });
-  chrome.tabs?.onActivated?.addListener?.(() => refreshContext());
-  chrome.tabs?.onUpdated?.addListener?.((_tabId, changeInfo) => {
-    if (changeInfo.status === 'complete' || changeInfo.title || changeInfo.url) refreshContext();
+
+  // Close floating menus on outside click
+  document.addEventListener('click', (event) => {
+    if (els.quickMoreMenu && !els.quickMoreMenu.hidden) els.quickMoreMenu.hidden = true;
+    if (els.contextScopeMenu && !els.contextScopeMenu.hidden && !event.target.closest('#contextScopeMenu, #contextScopeButton')) {
+      els.contextScopeMenu.hidden = true;
+      renderContextScopeControls();
+    }
+    const picker = document.getElementById('tabPicker');
+    if (!picker || picker.hidden) return;
+    if (!event.target.closest('#tabPicker, #tabPickerButton')) {
+      picker.hidden = true;
+    }
+  });
+  chrome.tabs?.onActivated?.addListener?.((activeInfo) => {
+    if (shouldRefreshForTabEvent({ scope: contextScope, eventType: 'activated', eventTabId: activeInfo?.tabId })) refreshContext();
+  });
+  chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
+    if (!(changeInfo.status === 'complete' || changeInfo.title || changeInfo.url)) return;
+    if (shouldRefreshForTabEvent({ scope: contextScope, eventType: 'updated', eventTabId: tabId })) refreshContext();
+  });
+  chrome.tabs?.onRemoved?.addListener?.((tabId) => {
+    if (shouldRefreshForTabEvent({ scope: contextScope, eventType: 'removed', eventTabId: tabId })) refreshContext();
   });
   chrome.runtime?.onMessage?.addListener?.((message, _sender, sendResponse) => {
     if (message?.type === 'HERMES_VOICE_TRANSCRIPT') {
@@ -4015,7 +4420,7 @@ try {
     await loadSkills({ quiet: true });
     await loadProfiles({ quiet: true });
     await loadSessions({ quiet: true });
-    await ensureDefaultBrowserSession({ focus: false });
+    await ensureSessionForActiveScope({ focus: false });
     await consumePendingVoiceDraft();
   } else {
     renderModelOptions();
@@ -4035,5 +4440,6 @@ try {
 }
 updateConnectionPrompt();
 renderVersionInfo();
+renderContextScopeControls();
 updateVoiceButtonState();
 renderEmptyState();
