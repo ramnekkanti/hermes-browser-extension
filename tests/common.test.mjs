@@ -886,10 +886,18 @@ test('sidepanel CSS constrains narrow panel overflow and keeps Hermes scrollbars
 });
 
 test('refresh page context button animates while refreshContext is running', () => {
+  const html = readFileSync(new URL('../extension/sidepanel.html', import.meta.url), 'utf8');
   const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../extension/sidepanel.css', import.meta.url), 'utf8');
+  assert.match(html, /id="refreshButton"[\s\S]*?<span class="refresh-glyph" aria-hidden="true">↻<\/span>/);
   assert.match(css, /@keyframes hermesRefreshSpin/);
   assert.match(css, /\.icon-refresh\.is-refreshing/);
+  assert.match(css, /\.icon-refresh\.is-refreshing\s+\.refresh-glyph\s*\{[^}]*animation:\s*hermesRefreshSpin/s);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.icon-refresh\.is-refreshing\s+\.refresh-glyph\s*\{[^}]*animation:\s*none/s);
+  assert.doesNotMatch(css, /\.icon-refresh\.is-refreshing::before/);
+  assert.doesNotMatch(css, /\.icon-refresh\.is-refreshing\s*\{[^}]*font-size:\s*0/s);
+  assert.match(source, /const REFRESH_BUTTON_MIN_BUSY_MS = 520/);
+  assert.match(source, /await waitForRefreshButtonSpin\(startedAt\)/);
   assert.match(source, /function setRefreshButtonBusy\(busy\)/);
   assert.match(source, /refreshButton\.addEventListener\('click',[\s\S]*?refreshContextWithSpin\(\)/);
 });

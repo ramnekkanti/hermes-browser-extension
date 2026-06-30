@@ -1589,30 +1589,35 @@ textarea:focus, input:focus, select:focus { border-color: var(--hermes-accent); 
 .composer-actions { margin-top: 8px; grid-template-columns: auto auto minmax(0, 1fr); }
 .composer-actions button, .settings-dialog footer button { min-height: 36px; padding: 9px 10px 7px; font-size: 10px; font-weight: 400; }
 .icon-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 36px;
   min-width: 36px;
   padding-inline: 0 !important;
   font-size: 16px !important;
   line-height: 1;
 }
+.refresh-glyph {
+  display: inline-block;
+  line-height: 1;
+  transform-origin: 50% 50%;
+}
 .icon-refresh.is-refreshing {
   color: var(--hermes-accent);
   border-color: var(--hermes-accent);
   cursor: progress;
-  font-size: 0 !important;
 }
-.icon-refresh.is-refreshing::before {
-  content: "";
-  display: inline-block;
-  width: 13px;
-  height: 13px;
-  border: 1px solid rgba(var(--hermes-ink-rgb),0.28);
-  border-top-color: currentColor;
-  border-radius: 50%;
-  animation: hermesRefreshSpin 540ms linear infinite;
+.icon-refresh.is-refreshing .refresh-glyph {
+  animation: hermesRefreshSpin 520ms linear infinite;
 }
 @keyframes hermesRefreshSpin {
   to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .icon-refresh.is-refreshing .refresh-glyph {
+    animation: none;
+  }
 }
 .secondary { background: var(--hermes-paper); color: var(--hermes-ink); }
 #testConnectionButton.success {

@@ -243,6 +243,7 @@ let connectionProbeInFlight = false;
 let gatewayCapabilities = { ...DEFAULT_GATEWAY_CAPABILITIES };
 let modelsRefreshing = false;
 let contextRefreshingFromButton = false;
+const REFRESH_BUTTON_MIN_BUSY_MS = 520;
 const CONNECTION_PROBE_INTERVAL_MS = 30_000;
 
 // remote-dashboard mode authenticates over the dashboard WebSocket with a
@@ -3674,13 +3675,21 @@ function setRefreshButtonBusy(busy) {
   els.refreshButton.disabled = Boolean(busy);
 }
 
+function waitForRefreshButtonSpin(startedAt) {
+  const elapsed = performance.now() - startedAt;
+  const remaining = Math.max(0, REFRESH_BUTTON_MIN_BUSY_MS - elapsed);
+  return remaining ? new Promise((resolve) => setTimeout(resolve, remaining)) : Promise.resolve();
+}
+
 async function refreshContextWithSpin() {
   if (contextRefreshingFromButton) return currentContext;
   contextRefreshingFromButton = true;
+  const startedAt = performance.now();
   setRefreshButtonBusy(true);
   try {
     return await refreshContext();
   } finally {
+    await waitForRefreshButtonSpin(startedAt);
     contextRefreshingFromButton = false;
     setRefreshButtonBusy(false);
   }
