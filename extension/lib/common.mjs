@@ -172,6 +172,26 @@ export function gatewayConnectionSummary({ gatewayMode = DEFAULT_SETTINGS.gatewa
   };
 }
 
+export function gatewayConnectionTroubleshooting({
+  gatewayMode = DEFAULT_SETTINGS.gatewayMode,
+  gatewayUrl = DEFAULT_SETTINGS.gatewayUrl,
+  state = 'unreachable',
+  probeDetail = '',
+} = {}) {
+  const mode = normalizeGatewayMode(gatewayMode);
+  const normalizedUrl = normalizeGatewayUrl(gatewayUrl || DEFAULT_SETTINGS.gatewayUrl);
+  if (state === 'connected') return '';
+  if (mode === 'remote-dashboard') {
+    return `Remote Hermes dashboard is not connected at ${normalizedUrl}. Open the dashboard in a browser tab and sign in, then reconnect.`;
+  }
+  if (mode === 'remote-api') {
+    return `Remote Hermes API is not reachable at ${normalizedUrl}. Check API_SERVER_ENABLED, host/port, firewall or VPN routing, and CORS for this extension origin.`;
+  }
+  const detail = String(probeDetail || '').trim();
+  const suffix = detail ? ` Last probe: ${detail}.` : '';
+  return `Hermes API server is not listening at ${normalizedUrl}. If this started after updating to Hermes Agent v0.18, restart Hermes Gateway after the update; if it still stays disconnected, the Hermes API server dependency aiohttp may be missing from the Hermes venv. Run Hermes status/doctor or reinstall/update Hermes, then reconnect.${suffix}`;
+}
+
 export function clampText(value = '', maxChars = 12_000) {
   const text = String(value || '');
   if (text.length <= maxChars) return text;

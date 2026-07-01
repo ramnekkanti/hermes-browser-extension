@@ -18,6 +18,7 @@ import {
   extractAssistantText,
   formatContextMeter,
   formatUpdateStatus,
+  gatewayConnectionTroubleshooting,
   gatewayConnectionSummary,
   groupModelsForMenu,
   groupSessionsForMenu,
@@ -274,8 +275,22 @@ function isConnected() {
 function connectionStateTitle(state, summary) {
   if (state.state === 'connected') return `Connected to ${summary.normalizedUrl}`;
   if (state.state === 'connecting') return `Checking ${summary.normalizedUrl}`;
-  if (state.state === 'unreachable') return `Gateway unreachable: ${connectionProbeDetail || summary.normalizedUrl}`;
+  if (state.state === 'unreachable') return gatewayConnectionTroubleshooting({
+    gatewayMode: settings.gatewayMode,
+    gatewayUrl: settings.gatewayUrl,
+    state: state.state,
+    probeDetail: connectionProbeDetail,
+  });
   return 'Not connected to Hermes';
+}
+
+function currentConnectionTroubleshooting(state = currentConnectionState()) {
+  return gatewayConnectionTroubleshooting({
+    gatewayMode: settings.gatewayMode,
+    gatewayUrl: settings.gatewayUrl,
+    state: state.state,
+    probeDetail: connectionProbeDetail,
+  });
 }
 
 function markConnectionProbe(status, detail = '') {
@@ -932,20 +947,25 @@ function updateConnectionPrompt() {
   if (!connected) {
     if (state.state === 'connecting') {
       els.sendButton.textContent = 'Checking...';
+      els.connectStatus.textContent = `Checking ${summary.title} at ${summary.normalizedUrl}...`;
       setStatus('warn', 'Checking Hermes', `${summary.title}: ${summary.normalizedUrl}`);
     } else if (state.state === 'unreachable') {
       els.sendButton.textContent = 'Reconnect';
-      setStatus('error', 'Gateway unreachable', connectionProbeDetail || `${summary.title} is not responding. Start Hermes Desktop/Gateway, then reconnect.`);
+      els.connectStatus.textContent = currentConnectionTroubleshooting(state);
+      setStatus('error', 'Hermes API unavailable', currentConnectionTroubleshooting(state) || `${summary.title} is not responding. Start Hermes Desktop/Gateway, then reconnect.`);
     } else {
       els.sendButton.textContent = 'Connect first';
       if (isRemoteWsMode()) {
+        els.connectStatus.textContent = 'Enter your dashboard https URL in Settings and sign in to it in a browser tab.';
         setStatus('warn', 'Set a remote dashboard', 'Enter your dashboard https URL in Settings and sign in to it in a browser tab.');
       } else {
+        els.connectStatus.textContent = `${summary.title}. Click Connect to Hermes or use Manual setup.`;
         setStatus('warn', 'Connect Hermes', `${summary.title}. Click Connect to Hermes or use Manual setup.`);
       }
     }
   } else {
     els.sendButton.textContent = sending ? 'Hermes running' : 'Ask Hermes';
+    els.connectStatus.textContent = 'Connected to Hermes. You can start chatting with page context.';
   }
   updateComposerBusyState();
 }
@@ -4206,7 +4226,7 @@ async function connectToHermes() {
     setStatus('ok', 'Hermes Browser Extension connected', normalizeGatewayUrl(settings.gatewayUrl));
   } catch (error) {
     markGatewayUnreachable(error);
-    els.connectStatus.textContent = `${error?.message || String(error)} Manual setup is still available in settings.`;
+    els.connectStatus.textContent = `${currentConnectionTroubleshooting() || error?.message || String(error)} Manual setup is still available in settings.`;
     openSettingsDialog();
   } finally {
     els.connectButton.disabled = false;
@@ -4453,7 +4473,7 @@ async function testConnection() {
     ok = true;
   } catch (error) {
     markGatewayUnreachable(error);
-    setStatus('error', 'Hermes gateway test failed', error?.message || String(error));
+    setStatus('error', 'Hermes gateway test failed', currentConnectionTroubleshooting() || error?.message || String(error));
   } finally {
     els.testConnectionButton.disabled = false;
     flashTestConnectionResult(ok);

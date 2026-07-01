@@ -19,6 +19,7 @@ import {
   estimateContextWindow,
   extractAssistantText,
   formatContextMeter,
+  gatewayConnectionTroubleshooting,
   gatewayConnectionSummary,
   isUsableRemoteGatewayUrl,
   formatYoutubeTranscript,
@@ -824,6 +825,35 @@ test('connectionStateForGateway uses live reachability instead of config presenc
     connectionStateForGateway({ gatewayMode: 'remote-dashboard', gatewayUrl: 'http://dash.example.com', remoteWsReadyState: 1 }),
     { state: 'unconfigured', connected: false, pillClass: 'warn' },
   );
+});
+
+test('gatewayConnectionTroubleshooting explains local v0.18 API server dependency failures', () => {
+  const message = gatewayConnectionTroubleshooting({
+    gatewayMode: 'local-api',
+    gatewayUrl: 'http://127.0.0.1:8642',
+    state: 'unreachable',
+    probeDetail: 'http://127.0.0.1:8642 · Failed to fetch',
+  });
+  assert.match(message, /API server is not listening/i);
+  assert.match(message, /127\.0\.0\.1:8642/);
+  assert.match(message, /Hermes Agent v0\.18/i);
+  assert.match(message, /aiohttp/i);
+  assert.match(message, /restart Hermes Gateway/i);
+  assert.doesNotMatch(message, /API_SERVER_KEY|Bearer|token/i);
+
+  const remote = gatewayConnectionTroubleshooting({
+    gatewayMode: 'remote-api',
+    gatewayUrl: 'http://host.ts.net:8642',
+    state: 'unreachable',
+    probeDetail: 'timeout',
+  });
+  assert.match(remote, /Remote Hermes API is not reachable/i);
+  assert.doesNotMatch(remote, /aiohttp|v0\.18/i);
+});
+
+test('connect panel surfaces local API troubleshooting while disconnected', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /els\.connectStatus\.textContent\s*=\s*currentConnectionTroubleshooting\(state\)/);
 });
 
 test('panel residency setting is present in defaults and settings UI copy', () => {
