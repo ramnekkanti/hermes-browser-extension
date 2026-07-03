@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildHermesReviewPrompt,
   callHermesReview,
+  deriveReviewLabels,
   eventReviewTarget,
   formatReviewComment,
   shouldSkipReview,
@@ -55,6 +56,49 @@ test('formatReviewComment includes a stable marker and commands caveat', () => {
   assert.match(body, /Hermes Agent Review/);
   assert.match(body, /Looks good\./);
   assert.match(body, /Automated review/);
+});
+
+test('deriveReviewLabels classifies Linux gateway/browser support bugs', () => {
+  const labels = deriveReviewLabels({
+    kind: 'issue',
+    number: 23,
+    title: "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'",
+    body: 'Ubuntu 24.04 Chrome extension v0.1.7. Hermes Agent v0.17.0. gateway.log shows API server listening on 127.0.0.1:8642. Wayland detected.',
+    labels: [],
+  });
+
+  for (const label of [
+    'type/bug',
+    'comp/gateway',
+    'comp/api-server',
+    'platform/linux',
+    'platform/chrome',
+    'platform/wayland',
+    'compat/hermes-v0.17',
+    'needs/traceback',
+    'needs/browser-console',
+    'status/needs-info',
+    'p2',
+  ]) {
+    assert.ok(labels.includes(label), `expected ${label}`);
+  }
+});
+
+test('deriveReviewLabels flags external GitHub docs links for security review', () => {
+  const diff = `diff --git a/README.md b/README.md
++++- [Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet) can add context.`;
+  const labels = deriveReviewLabels({
+    kind: 'pull_request',
+    number: 24,
+    title: 'docs: add Hermes Tweet browser context',
+    body: 'Add README note for runtime plugin context.',
+    labels: [],
+  }, diff);
+
+  assert.ok(labels.includes('type/docs'));
+  assert.ok(labels.includes('comp/docs'));
+  assert.ok(labels.includes('needs/security-review'));
+  assert.ok(labels.includes('p3'));
 });
 
 test('callHermesReview times out stuck local Hermes requests', async () => {

@@ -7,8 +7,10 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 import {
+  applyReviewLabels,
   buildHermesReviewPrompt,
   callHermesReview,
+  deriveReviewLabels,
   fetchPullRequestDiff,
   formatReviewComment,
   githubFetch,
@@ -71,6 +73,7 @@ export function buildReviewTargets({ prs = [], issues = [] } = {}) {
     url: pr.html_url || '',
     author: pr.user?.login || '',
     headSha: pr.head?.sha || '',
+    labels: Array.isArray(pr.labels) ? pr.labels : [],
   })).filter((target) => target.number);
 
   const issueTargets = issues
@@ -82,6 +85,7 @@ export function buildReviewTargets({ prs = [], issues = [] } = {}) {
       body: issue.body || '',
       url: issue.html_url || '',
       author: issue.user?.login || '',
+      labels: Array.isArray(issue.labels) ? issue.labels : [],
     }))
     .filter((target) => target.number);
 
@@ -113,6 +117,7 @@ async function reviewTarget({ repo, target, token, env, dryRun = false }) {
   const diff = target.kind === 'pull_request'
     ? await fetchPullRequestDiff({ repo, number: target.number, token })
     : '';
+  const labels = deriveReviewLabels(target, diff);
   const prompt = buildHermesReviewPrompt({
     target,
     repo,
@@ -123,11 +128,13 @@ async function reviewTarget({ repo, target, token, env, dryRun = false }) {
     url: target.url,
   });
   if (dryRun) {
-    return { action: 'dry-run', body: prompt };
+    return { action: 'dry-run', body: prompt, labels };
   }
+  await applyReviewLabels({ repo, target, token, labels });
   const review = await callHermesReview(prompt, env);
   const comment = `${formatReviewComment(target, review)}\n\nReviewed signature: \`${reviewTargetSignature(target)}\``;
-  return upsertReviewComment({ repo, target, token, body: comment });
+  const result = await upsertReviewComment({ repo, target, token, body: comment });
+  return { ...result, labels };
 }
 
 export async function runReviewWatch(rawEnv = process.env) {
@@ -165,7 +172,8 @@ export async function runReviewWatch(rawEnv = process.env) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runReviewWatch().then(({ completed, failed }) => {
     for (const item of completed) {
-      console.log(`${item.result.action} ${item.target.kind} #${item.target.number}`);
+      const labelText = item.result.labels?.length ? ` labels=${item.result.labels.join(',')}` : '';
+      console.log(`${item.result.action} ${item.target.kind} #${item.target.number}${labelText}`);
     }
     if (failed.length) {
       console.error(`Hermes review failed for ${failed.length} target${failed.length === 1 ? '' : 's'}.`);
