@@ -52,6 +52,40 @@ export function deriveProviderFromModelId(modelId = '') {
   return '';
 }
 
+const CONTEXT_TOKEN_KEYS = Object.freeze([
+  'context_length',
+  'contextTokens',
+  'context_tokens',
+  'contextWindow',
+  'context_window',
+  'max_context_tokens',
+  'maxContextTokens',
+  'max_context',
+  'context',
+]);
+
+function firstPositiveNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+  }
+  return 0;
+}
+
+function contextTokensFromObject(source = {}) {
+  if (!source || typeof source !== 'object') return 0;
+  const direct = firstPositiveNumber(...CONTEXT_TOKEN_KEYS.map((key) => source?.[key]));
+  if (direct) return direct;
+  return firstPositiveNumber(
+    ...CONTEXT_TOKEN_KEYS.map((key) => source?.metadata?.[key]),
+    ...CONTEXT_TOKEN_KEYS.map((key) => source?.limits?.[key]),
+    source?.limits?.context?.tokens,
+    source?.limits?.context?.max,
+    source?.context?.tokens,
+    source?.context?.max,
+  );
+}
+
 export function modelsFromModelOptionsPayload(payload = {}) {
   const providers = Array.isArray(payload?.providers) ? payload.providers : [];
   const models = [];
@@ -74,8 +108,8 @@ export function modelsFromModelOptionsPayload(payload = {}) {
       seen.add(dedupeKey);
       const modelCaps = caps[modelId] || {};
       const uiId = slug ? `${slug}::${modelId}` : modelId;
-      const entryContext = Number(entry?.context_length || entry?.contextTokens || 0) || 0;
-      const capsContext = Number(modelCaps?.context_length || 0) || 0;
+      const entryContext = contextTokensFromObject(entry);
+      const capsContext = contextTokensFromObject(modelCaps);
       models.push({
         id: uiId,
         rawModelId: modelId,
@@ -310,19 +344,43 @@ export function modelCatalogRefreshDecision({ previousSelectedModel = '', discov
   };
 }
 
+function modelDedupeKey(model = {}) {
+  const rawId = String(model?.rawModelId || model?.id || '').trim().toLowerCase();
+  if (!rawId) return '';
+  const provider = String(model?.provider || model?.providerLabel || model?.source || '').trim().toLowerCase();
+  return `${provider || 'models'}::${rawId}`;
+}
+
+export function mergeModelsByRawId(arrays = []) {
+  const seen = new Set();
+  const merged = [];
+  for (const models of arrays) {
+    if (!Array.isArray(models)) continue;
+    for (const model of models) {
+      const key = modelDedupeKey(model);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(model);
+    }
+  }
+  return merged;
+}
+
 export function mergeModelsWithRegistry({ registryModels = [], sessionModels = [] } = {}) {
   const out = [];
   const seen = new Set();
   // Registry first (these are the gateway-blessed models)
   for (const model of registryModels) {
-    if (!model || !model.id || seen.has(model.id)) continue;
-    seen.add(model.id);
+    const key = modelDedupeKey(model);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
     out.push({ ...model, source: model.source || 'registry' });
   }
   // Then session-discovered models, marking them as such
   for (const model of sessionModels) {
-    if (!model || !model.id || seen.has(model.id)) continue;
-    seen.add(model.id);
+    const key = modelDedupeKey(model);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
     out.push({ ...model, source: 'sessions' });
   }
   return out;
@@ -331,3 +389,106 @@ export function mergeModelsWithRegistry({ registryModels = [], sessionModels = [
 export const MODEL_DISCOVERY_DEFAULTS = Object.freeze({
   limit: SESSION_HISTORY_LIMIT,
 });
+
+export function externalModelsUrlForSource(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return '';
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+  if (!parsed.hostname || parsed.username || parsed.password) return '';
+  parsed.hash = '';
+  parsed.search = '';
+  parsed.pathname = parsed.pathname
+    .replace(/\/+$/, '')
+    .replace(/\/v1\/models$/i, '')
+    .replace(/\/models$/i, '')
+    .replace(/\/v1$/i, '');
+  parsed.pathname = `${parsed.pathname.replace(/\/+$/, '')}/v1/models`;
+  return parsed.toString();
+}
+
+export function normalizeExternalModelSourceList(sourceUrls = []) {
+  const seen = new Set();
+  const normalized = [];
+  for (const value of Array.isArray(sourceUrls) ? sourceUrls : []) {
+    const url = externalModelsUrlForSource(value);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    normalized.push(url);
+  }
+  return normalized;
+}
+
+function externalProviderLabel(modelsUrl = '') {
+  try {
+    const parsed = new URL(modelsUrl);
+    return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+  } catch {
+    return 'custom';
+  }
+}
+
+export async function discoverModelsFromExternalSources({
+  sourceUrls = [],
+  fetchFn = globalThis.fetch?.bind(globalThis),
+  timeoutMs = 5000,
+} = {}) {
+  const urls = normalizeExternalModelSourceList(sourceUrls);
+  if (!urls.length) return { ok: true, models: [], results: [] };
+  if (typeof fetchFn !== 'function') return { ok: false, error: 'no-fetch', models: [], results: [] };
+
+  const results = [];
+  for (const url of urls) {
+    try {
+      const response = await fetchWithTimeout(fetchFn, url, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      }, timeoutMs);
+      if (!response.ok) {
+        results.push({ url, ok: false, error: `status-${response.status}`, models: [] });
+        continue;
+      }
+      const payload = await response.json();
+      const rows = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : Array.isArray(payload?.models)
+            ? payload.models
+            : [];
+      const providerLabel = externalProviderLabel(url);
+      const provider = `custom:${providerLabel}`;
+      const models = rows
+        .map((entry) => {
+          const rawModelId = String(typeof entry === 'string' ? entry : entry?.id || entry?.model || entry?.name || '').trim();
+          if (!rawModelId) return null;
+          return {
+            id: `${provider}::${rawModelId}`,
+            rawModelId,
+            label: typeof entry === 'object' ? (entry.label || entry.name || rawModelId) : rawModelId,
+            provider,
+            providerLabel,
+            description: `Discovered from ${url}`,
+            contextTokens: contextTokensFromObject(entry),
+            source: 'external',
+            runtimeSelectable: false,
+          };
+        })
+        .filter(Boolean);
+      results.push({ url, ok: true, models });
+    } catch (error) {
+      results.push({
+        url,
+        ok: false,
+        error: error?.name === 'AbortError' ? 'timeout' : (error?.message || 'error'),
+        models: [],
+      });
+    }
+  }
+  return { ok: results.some((result) => result.ok), models: mergeModelsByRawId(results.map((result) => result.models)), results };
+}

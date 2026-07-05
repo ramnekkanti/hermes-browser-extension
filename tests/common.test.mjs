@@ -12,7 +12,9 @@ import {
   buildAudioTranscriptionBody,
   buildHermesModelOptions,
   buildHermesPrompt,
+  browserContextPayloadHash,
   busyComposerSubmitAction,
+  classifyRemoteGatewaySetup,
   clampText,
   classifyGatewayError,
   composerKeyAction,
@@ -20,6 +22,8 @@ import {
   collectReadablePageText,
   composerControlState,
   contextChipSummary,
+  contextControlState,
+  contextMeterDisplay,
 
   estimateContextWindow,
   extractAssistantText,
@@ -241,6 +245,34 @@ test('gateway diagnostics classify upstream runtime, auth, CORS, and missing rou
   assert.match(missing.detail, /route/i);
 });
 
+test('remote gateway diagnostic detects dashboard SSO, API auth, and CORS setup issues', () => {
+  const dashboard = classifyRemoteGatewaySetup({
+    url: 'https://agent.example.com:9119',
+    status: 302,
+    location: '/auth/login',
+    body: '<html>Sign in</html>',
+  });
+  assert.equal(dashboard.kind, 'dashboard-sso-url');
+  assert.match(dashboard.detail, /API server/i);
+  assert.match(dashboard.suggestedUrl, /:8642/);
+
+  const auth = classifyRemoteGatewaySetup({
+    url: 'https://agent.example.com:8642',
+    healthOk: true,
+    status: 401,
+    body: '{"error":"unauthorized"}',
+  });
+  assert.equal(auth.kind, 'api-auth');
+  assert.match(auth.detail, /Authorization: Bearer/i);
+
+  const cors = classifyRemoteGatewaySetup({
+    url: 'http://tailnet-host:8642',
+    error: 'TypeError: Failed to fetch because CORS origin is blocked',
+  });
+  assert.equal(cors.kind, 'cors');
+  assert.match(cors.detail, /API_SERVER_CORS_ORIGINS/);
+});
+
 test('connection diagnostics can represent connected-but-degraded optional failures', () => {
   assert.deepEqual(connectionStateForGateway({
     gatewayMode: 'local-api',
@@ -374,6 +406,57 @@ test('manifest allows remote Hermes API server connections from extension pages'
   assert.ok(manifest.host_permissions.includes('https://*/*'));
 });
 
+test('manifests expose an Alt+H action shortcut for opening the side panel', () => {
+  const sourceManifest = JSON.parse(readFileSync(new URL('../extension/manifest.json', import.meta.url), 'utf8'));
+  const rootManifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+
+  for (const manifest of [sourceManifest, rootManifest]) {
+    assert.equal(manifest.commands?._execute_action?.suggested_key?.default, 'Alt+H');
+    assert.match(manifest.commands?._execute_action?.description || '', /Open Hermes Browser Extension/i);
+  }
+});
+
+test('GitHub CI workflow verifies, lints, and keeps read-only repository permissions', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /permissions:\s*\n\s*contents:\s*read/);
+  assert.match(workflow, /npm ci/);
+  assert.match(workflow, /npm run verify/);
+  assert.match(workflow, /npm run lint/);
+});
+
+test('remote setup diagnostics UI exposes copyable API-server env guidance', () => {
+  const html = readFileSync(new URL('../extension/sidepanel.html', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../extension/sidepanel.css', import.meta.url), 'utf8');
+
+  assert.match(html, /id="remoteDiagnosticsPanel"/);
+  assert.match(html, /id="remoteEnvBlock"/);
+  assert.match(html, /id="copyRemoteEnvButton"/);
+  assert.match(html, /id="customModelSourcesInput"/);
+  assert.match(html, /Custom model source URLs/);
+  assert.match(source, /function renderRemoteDiagnostics/);
+  assert.match(source, /API_SERVER_CORS_ORIGINS/);
+  assert.match(source, /copyRemoteEnvButton/);
+  assert.match(css, /\.remote-env-block/);
+});
+
+test('model selection stays pending until runtime metadata confirms or warns', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /let modelSelectionVersion\s*=\s*0/);
+  assert.match(source, /let pendingModelRuntimeAck\s*=\s*null/);
+  assert.match(source, /client_runtime_version:\s*modelSelectionVersion/);
+  assert.match(source, /Hermes model confirmed|Model mismatch/);
+});
+
+test('custom model source rows are discovery-only until Hermes exposes them through the runtime', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /selectedModel\?\.source === 'external'/);
+  assert.match(source, /button\.disabled = true/);
+  assert.match(source, /Custom model source is discovery-only/);
+  assert.match(source, /normalizeExternalModelSourceList\(settings\.customModelSources/);
+  assert.match(source, /discoverModelsFromExternalSources\(\{/);
+});
+
 test('summarizeTabs highlights active tab and limits tab output', () => {
   const tabs = Array.from({ length: 7 }, (_, i) => ({ id: i + 1, active: i === 2, title: `Tab ${i + 1}`, url: `https://example.com/${i + 1}` }));
   const summary = summarizeTabs(tabs, 5);
@@ -404,8 +487,8 @@ test('buildHermesPrompt in chat-only mode includes no browser page context', () 
     settings: { ...DEFAULT_SETTINGS, includeTabs: true, includePageText: true, includeSelectedText: true },
   });
 
-  assert.match(prompt, /CHAT_ONLY_CONTEXT_START/);
-  assert.match(prompt, /No browser page context was read or attached/);
+  assert.match(prompt, /^\[Mode: chat-only\. No browser page context attached\.\]/);
+  assert.doesNotMatch(prompt, /CHAT_ONLY_CONTEXT_START|UNTRUSTED_BROWSER_CONTEXT_START/);
   assert.doesNotMatch(prompt, /Secret Dashboard|private\.example|selected secret|page secret|private meta/);
 });
 
@@ -901,6 +984,18 @@ test('estimateContextWindow respects selected tabs and chat-only disabled browse
   assert.equal(chatOnly.parts.pageMetadata.enabled, false);
   assert.equal(chatOnly.parts.youtubeTranscript.enabled, false);
   assert.equal(chatOnly.parts.pageText.enabled, false);
+
+  const chatOnlyPrompt = buildHermesPrompt({
+    userText: 'hello',
+    activeTab: { title: 'Private tab', url: 'https://private.example' },
+    tabs: [{ title: 'Private tab', url: 'https://private.example' }],
+    pageContext: { selectedText: 'selected secret', text: 'page secret', meta: { description: 'private meta' } },
+    settings: { ...DEFAULT_SETTINGS, includeTabs: true, includePageText: true, includeSelectedText: true },
+    contextScope: { mode: 'chat-only' },
+  });
+  assert.match(chatOnlyPrompt, /^\[Mode: chat-only\. No browser page context attached\.\]/);
+  assert.doesNotMatch(chatOnlyPrompt, /CHAT_ONLY_CONTEXT_START|UNTRUSTED_BROWSER_CONTEXT_START/);
+  assert.doesNotMatch(chatOnlyPrompt, /Private tab|private\.example|selected secret|page secret|private meta/);
 });
 
 test('formatContextMeter renders Hermes Desktop style compact usage labels', () => {
@@ -1286,6 +1381,101 @@ test('context accounting falls back to local prompt estimate when runtime prompt
   assert.equal(result.source, 'local-estimate');
 });
 
+test('context meter display is one accurate session context meter without cumulative spend copy', () => {
+  const accounting = contextAccountingSnapshot({
+    localPromptTokens: 120,
+    runtime: { context_length: 1_000_000, last_prompt_tokens: 50_000, provider: 'openai-codex', model: 'gpt-5.5' },
+    usage: { total_tokens: 3_600_000, prompt_tokens: 50_000, completion_tokens: 900 },
+  });
+  const display = contextMeterDisplay({
+    accounting,
+    runtimeLabel: 'openai-codex · gpt-5.5',
+  });
+
+  assert.equal(display.compactLabel, '50k/1M');
+  assert.equal(display.percentLabel, '5%');
+  assert.match(display.detail, /50,000 \/ 1,000,000 session context/);
+  assert.match(display.detail, /runtime · openai-codex · gpt-5\.5/);
+  assert.doesNotMatch(display.detail, /spend|last turn|cumulative|next prompt/i);
+  assert.match(display.title, /50,000 session context tokens used of 1,000,000 available/);
+  assert.doesNotMatch(display.title, /spend|last turn|cumulative/i);
+});
+
+test('sidepanel context meter copy does not split out cumulative token spend', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /last turn spend|Last turn spend|cumulative spend/i);
+  assert.match(source, /contextMeterDisplay\(/);
+});
+
+test('browser context payload hash changes when selected prompt tabs or included text changes', () => {
+  const base = browserContextPayloadHash({
+    activeTab: { id: 1, title: 'A', url: 'https://a.test' },
+    selectedTabs: [{ id: 1, title: 'A', url: 'https://a.test' }],
+    pageContext: { text: 'same', selectedText: 'selection' },
+    settings: { ...DEFAULT_SETTINGS, includePageText: true, includeSelectedText: true },
+  });
+  const changedTab = browserContextPayloadHash({
+    activeTab: { id: 1, title: 'A', url: 'https://a.test' },
+    selectedTabs: [
+      { id: 1, title: 'A', url: 'https://a.test' },
+      { id: 2, title: 'B', url: 'https://b.test' },
+    ],
+    pageContext: { text: 'same', selectedText: 'selection' },
+    settings: { ...DEFAULT_SETTINGS, includePageText: true, includeSelectedText: true },
+  });
+  const changedText = browserContextPayloadHash({
+    activeTab: { id: 1, title: 'A', url: 'https://a.test' },
+    selectedTabs: [{ id: 1, title: 'A', url: 'https://a.test' }],
+    pageContext: { text: 'changed', selectedText: 'selection' },
+    settings: { ...DEFAULT_SETTINGS, includePageText: true, includeSelectedText: true },
+  });
+  const omittedText = browserContextPayloadHash({
+    activeTab: { id: 1, title: 'A', url: 'https://a.test' },
+    selectedTabs: [{ id: 1, title: 'A', url: 'https://a.test' }],
+    pageContext: { text: 'changed', selectedText: 'selection' },
+    settings: { ...DEFAULT_SETTINGS, includePageText: false, includeSelectedText: true },
+  });
+
+  assert.match(base, /^[a-f0-9]{16}$/);
+  assert.notEqual(changedTab, base);
+  assert.notEqual(changedText, base);
+  assert.notEqual(omittedText, changedText);
+  assert.equal(browserContextPayloadHash({
+    activeTab: { id: 1, title: 'A', url: 'https://a.test' },
+    selectedTabs: [{ id: 1, title: 'A', url: 'https://a.test' }],
+    pageContext: { text: 'same', selectedText: 'selection' },
+    settings: { ...DEFAULT_SETTINGS, includePageText: true, includeSelectedText: true },
+  }), base);
+});
+
+test('context controls are capability gated and recommend compaction near the context ceiling', () => {
+  assert.deepEqual(contextControlState({ capabilities: { sessionContext: true, sessionCompress: true }, percentUsed: 72 }), {
+    canInspect: true,
+    canCompact: true,
+    compactRecommended: true,
+    label: 'Compact context',
+  });
+  assert.deepEqual(contextControlState({ capabilities: { sessionContext: true }, percentUsed: 72 }), {
+    canInspect: true,
+    canCompact: false,
+    compactRecommended: false,
+    label: 'Context status available',
+  });
+  assert.deepEqual(contextControlState({ capabilities: {}, percentUsed: 72 }), {
+    canInspect: false,
+    canCompact: false,
+    compactRecommended: false,
+    label: 'Context status unavailable',
+  });
+});
+
+test('sidepanel adopts rotated session id returned by native context compaction', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /payload\?\.rotated_session_id \|\| payload\?\.session_id/);
+  assert.match(source, /settings = \{ \.\.\.settings, sessionId: compactedSessionId \}/);
+  assert.match(source, /applySessionRuntimeSnapshot\(\{[\s\S]*source: 'context compaction'/);
+});
+
 test('OpenAI stream chunks append deltas and preserve final message payloads', () => {
   let text = appendOpenAiChunkText({ json: { choices: [{ delta: { content: 'Hel' } }] } }, '');
   text = appendOpenAiChunkText({ json: { choices: [{ delta: { content: 'lo' } }] } }, text);
@@ -1428,6 +1618,43 @@ test('discoverModelsFromRegistry picks up context_length from capabilities when 
   assert.equal(result.models[0].fast, false);
 });
 
+test('discoverModelsFromRegistry preserves common model context metadata aliases', async () => {
+  const { discoverModelsFromRegistry } = await import('../extension/lib/model-discovery.mjs');
+  const apiFetch = async () => ({ ok: true, status: 200 });
+  const readJsonResponse = async () => ({
+    providers: [
+      {
+        slug: 'nous',
+        name: 'Nous Portal',
+        authenticated: true,
+        models: [
+          { id: 'provider/context-window', context_window: 321000 },
+          { id: 'provider/context-tokens', metadata: { context_tokens: 654000 } },
+          { id: 'provider/max-context', metadata: { max_context_tokens: 987000 } },
+          { id: 'provider/nested-limits', limits: { context: 123000 } },
+          'provider/caps-window',
+        ],
+        capabilities: {
+          'provider/caps-window': { context_window: 456000 },
+        },
+      },
+    ],
+  });
+
+  const result = await discoverModelsFromRegistry({ apiFetch, readJsonResponse });
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.models.map((model) => [model.rawModelId, model.contextTokens]),
+    [
+      ['provider/context-window', 321000],
+      ['provider/context-tokens', 654000],
+      ['provider/max-context', 987000],
+      ['provider/nested-limits', 123000],
+      ['provider/caps-window', 456000],
+    ],
+  );
+});
+
 test('normalizeHermesModels preserves camelCase registry labels for grouping', () => {
   const models = normalizeHermesModels([
     { id: 'openai-codex::gpt-5.5', rawModelId: 'gpt-5.5', label: 'GPT-5.5', provider: 'openai-codex', providerLabel: 'OpenAI Codex', source: 'registry' },
@@ -1440,6 +1667,55 @@ test('normalizeHermesModels preserves camelCase registry labels for grouping', (
   assert.equal(models[1].rawModelId, 'gpt-5.5');
   assert.equal(isModelRuntimeSelectable(models[0]), true);
   assert.equal(modelRuntimeStatus(models[0]).label, 'requestable');
+});
+
+test('custom external model source helpers validate URLs, parse models, and keep rows discovery-only', async () => {
+  const {
+    discoverModelsFromExternalSources,
+    externalModelsUrlForSource,
+    mergeModelsByRawId,
+    normalizeExternalModelSourceList,
+  } = await import('../extension/lib/model-discovery.mjs');
+
+  assert.equal(externalModelsUrlForSource('http://wimpy:8080/v1'), 'http://wimpy:8080/v1/models');
+  assert.equal(externalModelsUrlForSource('https://models.example.com/api/v1/models'), 'https://models.example.com/api/v1/models');
+  assert.equal(externalModelsUrlForSource('file:///tmp/models'), '');
+  assert.equal(externalModelsUrlForSource('https://user:pass@example.com/v1'), '');
+  assert.deepEqual(normalizeExternalModelSourceList([
+    'http://wimpy:8080/v1',
+    'http://wimpy:8080/v1/models',
+    'notaurl',
+  ]), ['http://wimpy:8080/v1/models']);
+
+  const calls = [];
+  const result = await discoverModelsFromExternalSources({
+    sourceUrls: ['http://wimpy:8080/v1', 'http://192.168.1.50:11434/models'],
+    fetchFn: async (url, options) => {
+      calls.push({ url, auth: options.headers?.Authorization || '' });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [{ id: 'local/mistral', context_length: 131072 }, 'gpt-oss-local'] }),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls.map((call) => call.url), ['http://wimpy:8080/v1/models', 'http://192.168.1.50:11434/v1/models']);
+  assert.deepEqual(calls.map((call) => call.auth), ['', '']);
+  assert.equal(result.models.length, 4);
+  assert.equal(result.models[0].source, 'external');
+  assert.equal(result.models[0].runtimeSelectable, false);
+  assert.equal(result.models[0].contextTokens, 131072);
+  assert.equal(isModelRuntimeSelectable(result.models[0]), false);
+  assert.equal(modelRuntimeStatus(result.models[0]).label, 'discovered');
+
+  const merged = mergeModelsByRawId([
+    [{ id: 'openai::gpt-5.5', rawModelId: 'gpt-5.5', provider: 'openai' }],
+    [{ id: 'custom:wimpy::gpt-5.5', rawModelId: 'gpt-5.5', provider: 'custom:wimpy' }],
+    [{ id: 'openai::gpt-5.5', rawModelId: 'gpt-5.5', provider: 'openai' }],
+  ]);
+  assert.deepEqual(merged.map((model) => model.id), ['openai::gpt-5.5', 'custom:wimpy::gpt-5.5']);
 });
 
 test('discoverModelsFromSessions extracts unique model names from /api/sessions', async () => {

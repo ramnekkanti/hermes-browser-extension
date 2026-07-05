@@ -21,6 +21,8 @@ test('normalizeGatewayCapabilities maps the Hermes /v1/capabilities API contract
       run_events_sse: true,
       run_stop: true,
       run_steer: true,
+      session_context: true,
+      session_compress: true,
       session_resources: true,
       session_chat: true,
       session_chat_streaming: true,
@@ -39,6 +41,8 @@ test('normalizeGatewayCapabilities maps the Hermes /v1/capabilities API contract
       run_events: { method: 'GET', path: '/v1/runs/{run_id}/events' },
       run_stop: { method: 'POST', path: '/v1/runs/{run_id}/stop' },
       run_steer: { method: 'POST', path: '/v1/runs/{run_id}/steer' },
+      session_context: { method: 'GET', path: '/api/sessions/{session_id}/context' },
+      session_compress: { method: 'POST', path: '/api/sessions/{session_id}/compress' },
       session_chat: { method: 'POST', path: '/api/sessions/{session_id}/chat' },
       session_chat_stream: { method: 'POST', path: '/api/sessions/{session_id}/chat/stream' },
     },
@@ -56,6 +60,8 @@ test('normalizeGatewayCapabilities maps the Hermes /v1/capabilities API contract
   assert.equal(caps.runEvents, true);
   assert.equal(caps.runStop, true);
   assert.equal(caps.runSteer, true);
+  assert.equal(caps.sessionContext, true);
+  assert.equal(caps.sessionCompress, true);
   assert.equal(caps.profiles, false);
   assert.equal(caps.audioTranscription, false);
   assert.equal(caps.browserPairing, false);
@@ -78,6 +84,8 @@ test('normalizeGatewayCapabilities degrades missing capability routes into a leg
   assert.equal(caps.sessionChat, true);
   assert.equal(caps.skills, true);
   assert.equal(caps.runSteer, false);
+  assert.equal(caps.sessionContext, false);
+  assert.equal(caps.sessionCompress, false);
   assert.equal(caps.profiles, false);
   assert.equal(caps.audioTranscription, false);
   assert.equal(caps.browserPairing, false);
@@ -101,6 +109,8 @@ test('capabilityStatusRows turn capabilities into compatibility-panel statuses',
   assert.equal(byKey.browserPairing.status, 'warn');
   assert.equal(byKey.runSteer.status, 'warn');
   assert.match(byKey.runSteer.detail, /queued drafts/i);
+  assert.equal(byKey.sessionContext.status, 'warn');
+  assert.equal(byKey.sessionCompress.status, 'warn');
 });
 
 test('connectionSecuritySummary masks token state and classifies transport', () => {
@@ -138,6 +148,7 @@ test('buildContextReceipt summarizes exactly what browser context was sent', () 
       { kind: 'image', label: 'screen.png', localPath: 'C:/tmp/screen.png' },
       { kind: 'file', label: 'notes.txt', text: 'notes' },
     ],
+    contextHash: 'a1b2c3d4e5f60789',
     settings: {
       includeTabs: true,
       includePageText: true,
@@ -150,6 +161,7 @@ test('buildContextReceipt summarizes exactly what browser context was sent', () 
     'Context scope',
     'Active tab',
     'Pinned tab',
+    'Context hash',
     'Selected text',
     'Page text',
     'YouTube transcript',
@@ -159,6 +171,7 @@ test('buildContextReceipt summarizes exactly what browser context was sent', () 
     'Redactions',
   ]);
   assert.match(receipt.items.find((item) => item.label === 'Active tab').value, /Hermes Docs/);
+  assert.equal(receipt.items.find((item) => item.label === 'Context hash').value, 'a1b2c3d4e5f60789');
   assert.equal(receipt.items.find((item) => item.label === 'Open tabs in window').value, '2');
   assert.equal(receipt.items.find((item) => item.label === 'Tabs sent to Hermes').value, '1');
   assert.match(receipt.items.find((item) => item.label === 'Attachments').value, /1 image, 1 file/);
@@ -207,7 +220,11 @@ test('sidepanel UI has compatibility, token hygiene, and What Hermes saw surface
   assert.doesNotMatch(html, /Hermes on another machine, reached over https/);
   assert.doesNotMatch(html, /v0\.1\.3/);
   assert.match(js, /appendContextReceipt/);
+  assert.match(js, /browserContextPayloadHash/);
+  assert.match(js, /contextControlState/);
   assert.match(js, /What Hermes saw/);
+  assert.match(html, /id="contextCompactButton"/);
+  assert.match(html, /id="contextControlStatus"/);
   assert.match(js, /browserPairing/);
   assert.match(js, /imageUpload/);
   assert.match(voiceJs, /SpeechRecognition|webkitSpeechRecognition/);

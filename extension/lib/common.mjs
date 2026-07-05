@@ -57,6 +57,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   panelResidencyMode: 'tab-attached',
   maxTabs: 12,
   maxLocalMessages: 40,
+  customModelSources: [],
 });
 
 export const HERMES_BROWSER_SYSTEM_PROMPT = `You are Hermes running through the Hermes Browser Extension side panel.
@@ -179,6 +180,70 @@ export function gatewayConnectionSummary({ gatewayMode = DEFAULT_SETTINGS.gatewa
     title: mode.title,
     statusText: `${mode.title}: ${normalizedUrl}`,
     setupHint,
+  };
+}
+
+export function classifyRemoteGatewaySetup({
+  url = '',
+  status = 0,
+  location = '',
+  body = '',
+  healthOk = false,
+  error = '',
+} = {}) {
+  const urlText = String(url || '').trim();
+  const text = `${location} ${body} ${error}`.replace(/\s+/g, ' ').trim().toLowerCase();
+  const statusNumber = Number(status || 0);
+  const suggestedUrl = urlText
+    .replace(/:(9119|443)(?=\/|$)/, ':8642')
+    .replace(/^https:\/\/([^/:]+)$/, 'https://$1:8642');
+
+  if (
+    statusNumber === 302
+    || statusNumber === 303
+    || /\/auth\/login|oauth|sso|sign in|signin|login required|desktop ipc bridge/.test(text)
+    || /:9119(?=\/|$)/.test(urlText)
+  ) {
+    return {
+      kind: 'dashboard-sso-url',
+      title: 'Dashboard URL detected',
+      detail: 'This looks like the Hermes Dashboard SSO endpoint. Browser API mode needs the Hermes API server URL on :8642 plus an Authorization: Bearer token.',
+      suggestedUrl: suggestedUrl && suggestedUrl !== urlText ? suggestedUrl : '',
+    };
+  }
+
+  if (healthOk && (statusNumber === 401 || statusNumber === 403 || /unauthorized|forbidden|invalid api key|invalid token/.test(text))) {
+    return {
+      kind: 'api-auth',
+      title: 'API server needs authorization',
+      detail: 'Health responded, but protected Browser/model routes need Authorization: Bearer <token>. Paste the API key or scoped browser token in Settings.',
+      suggestedUrl: urlText,
+    };
+  }
+
+  if (/cors|cross-origin|failed to fetch|networkerror|load failed|typeerror: fetch/.test(text)) {
+    return {
+      kind: 'cors',
+      title: 'CORS origin not allowed',
+      detail: 'Browser could not reach the Hermes API from this extension origin. Add chrome-extension://<extension-id> to API_SERVER_CORS_ORIGINS on the remote host.',
+      suggestedUrl: urlText,
+    };
+  }
+
+  if (statusNumber === 401 || statusNumber === 403) {
+    return {
+      kind: 'api-auth',
+      title: 'API server needs authorization',
+      detail: 'Hermes rejected this request. Check the API key/browser token and keep the URL pointed at the API server, not the Dashboard SSO endpoint.',
+      suggestedUrl: urlText,
+    };
+  }
+
+  return {
+    kind: 'unknown',
+    title: 'Remote setup issue',
+    detail: error || body || 'The Browser Extension could not classify this remote gateway response.',
+    suggestedUrl: urlText,
   };
 }
 
@@ -522,6 +587,43 @@ export function formatContextMeter({ estimatedTokens = 0, modelContextTokens = 0
     usedLabel: formatCompactTokenCount(used),
     limitLabel: hasLimit ? formatCompactTokenCount(limit) : '∞',
     compactLabel: hasLimit ? `${formatCompactTokenCount(used)}/${formatCompactTokenCount(limit)}` : `${formatCompactTokenCount(used)} tok`,
+  };
+}
+
+export function contextMeterDisplay({ accounting = {}, runtimeLabel = '', modelContextTokens = 0 } = {}) {
+  const liveContextTokens = positiveTokenNumber(accounting?.liveContextTokens);
+  const contextLimitTokens = firstPositiveToken(accounting?.contextLimitTokens, modelContextTokens);
+  const meter = formatContextMeter({ estimatedTokens: liveContextTokens, modelContextTokens: contextLimitTokens });
+  const sourceLabel = accounting?.source === 'runtime'
+    ? `runtime${runtimeLabel ? ` · ${runtimeLabel}` : ''}`
+    : 'local session estimate';
+  const usedLabel = formatWholeNumber(liveContextTokens);
+  const limitLabel = formatWholeNumber(contextLimitTokens);
+  const detail = contextLimitTokens
+    ? `${usedLabel} / ${limitLabel} session context · ${meter.percentLabel} · ${sourceLabel}`
+    : `${usedLabel} session context tokens · unknown max context · ${sourceLabel}`;
+  const title = contextLimitTokens
+    ? `${usedLabel} session context tokens used of ${limitLabel} available (${meter.percentLabel}, ${sourceLabel}).`
+    : `${usedLabel} session context tokens estimated. Selected/effective model did not report a max context window (${sourceLabel}).`;
+  return {
+    ...meter,
+    liveContextTokens,
+    contextLimitTokens,
+    sourceLabel,
+    detail,
+    title,
+  };
+}
+
+export function contextControlState({ capabilities = {}, percentUsed = 0 } = {}) {
+  const canInspect = Boolean(capabilities.sessionContext || capabilities.contextStatus || capabilities.context_status);
+  const canCompact = Boolean(capabilities.sessionCompress || capabilities.contextCompress || capabilities.context_compress);
+  const compactRecommended = canCompact && Number(percentUsed || 0) >= 70;
+  return {
+    canInspect,
+    canCompact,
+    compactRecommended,
+    label: canCompact ? 'Compact context' : (canInspect ? 'Context status available' : 'Context status unavailable'),
   };
 }
 
@@ -1255,6 +1357,12 @@ export function modelRuntimeStatus(model = {}) {
       detail: 'The extension will send this model/provider in the Hermes request body.',
     };
   }
+  if (model.source === 'external') {
+    return {
+      label: 'discovered',
+      detail: 'Discovered from a user-configured OpenAI-compatible endpoint. Hermes will not route to it unless the connected Hermes runtime also exposes that model/provider.',
+    };
+  }
   return {
     label: 'observed',
     detail: 'Observed from session history. The extension will send this model/provider, but older Hermes gateways may ignore per-request overrides and use their configured model.',
@@ -1513,8 +1621,70 @@ function isChatOnlyScope(scope = {}) {
   return scope?.mode === 'chat-only';
 }
 
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hashString16(value = '') {
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    left ^= code;
+    left = Math.imul(left, 0x01000193) >>> 0;
+    right ^= code + index;
+    right = Math.imul(right, 0x85ebca6b) >>> 0;
+  }
+  return `${left.toString(16).padStart(8, '0')}${right.toString(16).padStart(8, '0')}`;
+}
+
+function hashSafeTab(tab = {}) {
+  const safe = privacySafeTabForPrompt(tab || {});
+  return {
+    id: Number.isFinite(Number(tab?.id)) ? Number(tab.id) : null,
+    title: safe.title || '',
+    url: safe.url || '',
+  };
+}
+
+export function browserContextPayloadHash({ activeTab = {}, selectedTabs = [], pageContext = {}, settings = DEFAULT_SETTINGS } = {}) {
+  const mergedSettings = { ...DEFAULT_SETTINGS, ...settings };
+  const payload = {
+    activeTab: hashSafeTab(activeTab),
+    selectedTabs: (Array.isArray(selectedTabs) ? selectedTabs : [])
+      .map(hashSafeTab)
+      .sort((a, b) => String(a.id ?? a.url).localeCompare(String(b.id ?? b.url))),
+    contextDepth: mergedSettings.contextDepth,
+    includeTabs: Boolean(mergedSettings.includeTabs),
+    includePageText: Boolean(mergedSettings.includePageText),
+    includeSelectedText: Boolean(mergedSettings.includeSelectedText),
+    selectedText: mergedSettings.includeSelectedText
+      ? clampText(redactSensitiveText(normalizeReadableWhitespace(pageContext?.selectedText || '')), 12_000)
+      : '',
+    pageText: mergedSettings.includePageText
+      ? clampText(redactSensitiveText(normalizeReadableWhitespace(pageContext?.text || '')), 20_000)
+      : '',
+    youtubeTranscript: pageContext?.youtubeTranscript?.ok
+      ? clampText(formatYoutubeTranscript(pageContext.youtubeTranscript, 20_000), 20_000)
+      : '',
+    meta: {
+      description: pageContext?.meta?.description || '',
+      language: pageContext?.meta?.language || '',
+      headings: Array.isArray(pageContext?.meta?.headings)
+        ? pageContext.meta.headings.slice(0, 20).map((heading) => ({ level: heading.level || '', text: heading.text || '' }))
+        : [],
+    },
+  };
+  return hashString16(stableStringify(payload));
+}
+
 function buildChatOnlyPrompt(userText = '') {
-  return `CHAT_ONLY_CONTEXT_START\nNo browser page context was read or attached. The user chose Chat only mode in Hermes Browser Extension. Answer as a normal Hermes assistant without using active tab, selected text, open tabs, page metadata, transcript, or page text.\nCHAT_ONLY_CONTEXT_END\n\nUSER_REQUEST_START\n${String(userText || '').trim()}\nUSER_REQUEST_END`;
+  return `[Mode: chat-only. No browser page context attached.]\n\n${String(userText || '').trim()}`;
 }
 
 export function buildHermesPrompt({ userText, activeTab, tabs = [], pageContext, selectedTabs, contextScope, settings = DEFAULT_SETTINGS }) {

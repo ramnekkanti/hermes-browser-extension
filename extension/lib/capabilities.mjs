@@ -26,6 +26,8 @@ export const DEFAULT_GATEWAY_CAPABILITIES = Object.freeze({
   runEvents: false,
   runStop: false,
   runSteer: false,
+  sessionContext: false,
+  sessionCompress: false,
   audioTranscription: false,
   browserPairing: false,
   imageUpload: false,
@@ -77,6 +79,8 @@ function legacyCapabilities({ healthOk = false, hasApiKey = false, warning = '' 
     runEvents: Boolean(healthOk && hasApiKey),
     runStop: Boolean(healthOk && hasApiKey),
     runSteer: false,
+    sessionContext: false,
+    sessionCompress: false,
     profiles: false,
     audioTranscription: false,
     browserPairing: false,
@@ -116,6 +120,8 @@ export function normalizeGatewayCapabilities(payload = null, { healthOk = false,
     runEvents: inferredFeature(features, endpoints, ['run_events_sse', 'run_events'], ['run_events']),
     runStop: inferredFeature(features, endpoints, ['run_stop'], ['run_stop']),
     runSteer: inferredFeature(features, endpoints, ['run_steer'], ['run_steer']),
+    sessionContext: inferredFeature(features, endpoints, ['session_context', 'context_status', 'contextStatus'], ['session_context', 'session_context_get', 'context_status']),
+    sessionCompress: inferredFeature(features, endpoints, ['session_compress', 'context_compress', 'contextCompress'], ['session_compress', 'session_compress_post', 'context_compress']),
     audioTranscription: inferredFeature(features, endpoints, ['audio_api', 'audio_transcription', 'audioTranscription'], ['audio_transcribe', 'audio_transcription']),
     browserPairing: inferredFeature(features, endpoints, ['browser_extension_pairing', 'browserPairing'], ['browser_extension_pair_start', 'browser_pairing', 'pair_start']),
     imageUpload: inferredFeature(features, endpoints, ['browser_image_upload', 'image_upload', 'imageUpload'], ['browser_image_upload', 'image_upload', 'uploads_images']),
@@ -153,6 +159,8 @@ export function capabilityStatusRows(caps = DEFAULT_GATEWAY_CAPABILITIES, { brow
     { key: 'browserPairing', label: 'Browser pairing', ...statusFor(caps.browserPairing, WARNING_CAPABILITY_COPY.browserPairing, 'Automatic pairing route available.') },
     { key: 'runs', label: 'Runs API', ...statusFor(caps.runs, 'Runs API unavailable — chat/session routes will be used.') },
     { key: 'runSteer', label: 'Run steering', ...statusFor(caps.runSteer, 'Run steering unavailable — queued drafts can still send after the current turn.', 'Active-run steering route available.') },
+    { key: 'sessionContext', label: 'Context status', ...statusFor(caps.sessionContext, 'Native session context status unavailable — Browser uses local/runtime estimates.', 'Native session context inspection available.') },
+    { key: 'sessionCompress', label: 'Context compaction', ...statusFor(caps.sessionCompress, 'Native session compaction unavailable — Browser will not show an active compact action.', 'Native session compaction available.') },
   ];
 }
 
@@ -218,7 +226,7 @@ function contextScopeLabel(scope = {}) {
   return 'Follow active tab';
 }
 
-export function buildContextReceipt({ context = {}, attachments = [], settings = {} } = {}) {
+export function buildContextReceipt({ context = {}, attachments = [], settings = {}, contextHash = '' } = {}) {
   const contextScope = context.contextScope || {};
   if (contextScope.mode === 'chat-only') {
     return {
@@ -249,6 +257,7 @@ export function buildContextReceipt({ context = {}, attachments = [], settings =
         : 'current pinned tab',
     });
   }
+  if (contextHash) items.push({ label: 'Context hash', value: String(contextHash) });
   items.push(
     {
       label: 'Selected text',

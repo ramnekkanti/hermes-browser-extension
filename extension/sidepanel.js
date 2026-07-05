@@ -8,20 +8,23 @@ import {
   buildAudioTranscriptionBody,
   buildHermesModelOptions,
   buildHermesPrompt,
+  browserContextPayloadHash,
   busyComposerSubmitAction,
   clampText,
   classifyGatewayError,
+  classifyRemoteGatewaySetup,
   composerControlState,
   composerKeyAction,
   connectionStateForGateway,
   contextAccountingSnapshot,
   contextChipSummary,
+  contextControlState,
+  contextMeterDisplay,
   encodeSessionId,
   estimateContextWindow,
   estimateTokens,
   escapeHtml,
   extractAssistantText,
-  formatContextMeter,
   formatUpdateStatus,
   gatewayConnectionTroubleshooting,
   gatewayConnectionSummary,
@@ -64,6 +67,12 @@ import { extractYouTubeVideoId } from './lib/transcript.mjs';
 import { buildDashboardWsUrl, createGatewayClient, WS_EVENTS, WS_METHODS } from './lib/gateway-ws.mjs';
 import { mintWsTicket, ticketFailureHelp } from './lib/dashboard-bridge.mjs';
 import {
+  deriveStartupView,
+  initialStartupReadiness,
+  reduceStartupReadiness,
+  selectedModelReadiness,
+} from './lib/readiness.mjs';
+import {
   DEFAULT_GATEWAY_CAPABILITIES,
   buildContextReceipt,
   capabilityStatusRows,
@@ -81,10 +90,13 @@ import {
 import {
   dashboardModelDiscoveryBaseUrl,
   discoverModelsFromDashboard,
+  discoverModelsFromExternalSources,
   discoverModelsFromRegistry,
   discoverModelsFromSessions,
+  mergeModelsByRawId,
   mergeModelsWithRegistry,
   modelCatalogRefreshDecision,
+  normalizeExternalModelSourceList,
   shouldTrySessionModelFallback,
 } from './lib/model-discovery.mjs';
 import {
@@ -115,6 +127,11 @@ const sidePanelParams = parseSidePanelParams(globalThis.location?.search || '');
 
 const els = {
   appScroll: $('#appScroll'),
+  startupScreen: $('#startupScreen'),
+  startupTitle: $('#startupTitle'),
+  startupDetail: $('#startupDetail'),
+  startupProgress: $('#startupProgress'),
+  startupStepList: $('#startupStepList'),
   connectPanel: $('#connectPanel'),
   connectButton: $('#connectButton'),
   manualSettingsButton: $('#manualSettingsButton'),
@@ -183,11 +200,17 @@ const els = {
   contextMeterFill: $('#contextMeterFill'),
   contextPopover: $('#contextPopover'),
   contextBreakdown: $('#contextBreakdown'),
+  contextControlStatus: $('#contextControlStatus'),
+  contextCompactButton: $('#contextCompactButton'),
   gatewayModeInput: $('#gatewayModeInput'),
   remoteTransportRow: $('#remoteTransportRow'),
   gatewayUrlInput: $('#gatewayUrlInput'),
   gatewayHelp: $('#gatewayHelp'),
   apiKeyInput: $('#apiKeyInput'),
+  remoteDiagnosticsPanel: $('#remoteDiagnosticsPanel'),
+  remoteDiagnosticsList: $('#remoteDiagnosticsList'),
+  remoteEnvBlock: $('#remoteEnvBlock'),
+  copyRemoteEnvButton: $('#copyRemoteEnvButton'),
   sessionIdInput: $('#sessionIdInput'),
   sessionTitleInput: $('#sessionTitleInput'),
   contextDepthInput: $('#contextDepthInput'),
@@ -211,6 +234,7 @@ const els = {
   agentSchemeInput: $('#agentSchemeInput'),
   agentPortsInput: $('#agentPortsInput'),
   agentPickerStatus: $('#agentPickerStatus'),
+  customModelSourcesInput: $('#customModelSourcesInput'),
   themeGrid: $('#themeGrid'),
   colorModeButtons: Array.from(document.querySelectorAll('[data-color-mode]')),
   quickMoreMenu: $('#quickMoreMenu'),
@@ -219,6 +243,7 @@ const els = {
 };
 
 let settings = { ...DEFAULT_SETTINGS };
+let startupReadiness = initialStartupReadiness(settings);
 let contextScope = normalizeContextScope(DEFAULT_CONTEXT_SCOPE);
 let previousConversationScope = normalizeContextScope(DEFAULT_CONTEXT_SCOPE);
 let currentContext = { activeTab: null, tabs: [], pageContext: null, contextScope };
@@ -230,6 +255,9 @@ let availableSkills = [];
 let availableProfiles = [];
 let attachments = [];
 let selectedModelProvider = '';
+let modelSelectionVersion = 0;
+let pendingModelRuntimeAck = null;
+let lastRemoteDiagnostic = null;
 const openSessionGroups = new Set();
 const closedSessionGroups = new Set();
 let sending = false;
@@ -300,6 +328,41 @@ function isConnected() {
   return currentConnectionState().connected;
 }
 
+function renderStartupReadiness() {
+  const view = deriveStartupView(startupReadiness);
+  if (els.startupScreen) els.startupScreen.hidden = !view.visible;
+  if (els.startupTitle) els.startupTitle.textContent = view.title;
+  if (els.startupDetail) els.startupDetail.textContent = view.detail;
+  if (els.startupProgress) els.startupProgress.style.width = `${Math.max(0, Math.min(100, view.progress))}%`;
+  if (els.startupStepList) {
+    els.startupStepList.textContent = '';
+    for (const step of view.steps) {
+      const item = document.createElement('li');
+      item.className = `startup-step startup-step-${step.status}`;
+      item.dataset.status = step.status;
+      const label = document.createElement('strong');
+      label.textContent = step.label;
+      const detail = document.createElement('span');
+      detail.textContent = step.detail || step.status;
+      item.append(label, detail);
+      els.startupStepList.appendChild(item);
+    }
+  }
+  document.body?.classList.toggle('startup-active', view.visible);
+  els.composer?.classList.toggle('startup-blocked', view.visible);
+  if (els.input) els.input.disabled = view.visible;
+  if (els.sendButton) els.sendButton.disabled = view.visible || els.sendButton.disabled;
+  if (els.inlineSendButton) els.inlineSendButton.disabled = view.visible || els.inlineSendButton.disabled;
+  if (els.modelMenuButton) els.modelMenuButton.disabled = view.visible;
+  if (els.newSessionButton) els.newSessionButton.disabled = view.visible;
+  if (!view.visible) updateComposerBusyState();
+}
+
+function setStartupReadiness(event = {}) {
+  startupReadiness = reduceStartupReadiness(startupReadiness, event);
+  renderStartupReadiness();
+}
+
 function connectionStateTitle(state, summary) {
   if (state.state === 'connected') return `Connected to ${summary.normalizedUrl}`;
   if (state.state === 'degraded') return currentConnectionTroubleshooting(state) || `Connected with warnings to ${summary.normalizedUrl}`;
@@ -343,6 +406,7 @@ function openSettingsDialog() {
   syncSettingsForm();
   renderCompatibilityPanel();
   renderConnectionSecurity();
+  renderRemoteDiagnostics(lastRemoteDiagnostic);
   els.settingsDialog.hidden = false;
   els.settingsDialog.setAttribute('aria-hidden', 'false');
   els.apiKeyInput.focus();
@@ -385,6 +449,39 @@ function renderGatewayHelp() {
   });
   if (els.gatewayHelp) els.gatewayHelp.textContent = summary.setupHint;
   if (els.gatewayUrlInput) els.gatewayUrlInput.placeholder = summary.mode.defaultUrl || DEFAULT_SETTINGS.gatewayUrl;
+}
+
+function remoteEnvBlockText() {
+  const origin = currentExtensionOrigin() || 'chrome-extension://<extension-id>';
+  return [
+    'API_SERVER_ENABLED=true',
+    'API_SERVER_HOST=0.0.0.0',
+    'API_SERVER_PORT=8642',
+    'API_SERVER_KEY=<strong-token>',
+    `API_SERVER_CORS_ORIGINS=${origin}`,
+  ].join('\n');
+}
+
+function renderRemoteDiagnostics(diagnostic = lastRemoteDiagnostic) {
+  if (!els.remoteDiagnosticsPanel) return;
+  lastRemoteDiagnostic = diagnostic || null;
+  const shouldShow = Boolean(diagnostic) && isRemoteMode();
+  els.remoteDiagnosticsPanel.hidden = !shouldShow;
+  if (!shouldShow) return;
+  const origin = currentExtensionOrigin() || 'chrome-extension://<extension-id>';
+  const rows = [
+    ['Diagnosis', diagnostic.title || 'Remote setup issue'],
+    ['Detail', diagnostic.detail || 'The Browser Extension could not classify this response.'],
+    ['Suggested API URL', diagnostic.suggestedUrl || 'Use your API server host with port 8642'],
+    ['Required CORS origin', origin],
+  ];
+  if (els.remoteDiagnosticsList) {
+    els.remoteDiagnosticsList.innerHTML = rows.map(([key, value]) => `
+      <dt>${escapeHtml(key)}</dt>
+      <dd>${escapeHtml(value)}</dd>
+    `).join('');
+  }
+  if (els.remoteEnvBlock) els.remoteEnvBlock.textContent = remoteEnvBlockText();
 }
 
 function renderCompatibilityPanel() {
@@ -1134,14 +1231,18 @@ function currentComposerDraftState() {
 
 function updateComposerBusyState() {
   const state = currentComposerDraftState();
+  const startupBlocking = !startupReadiness.ready;
   setComposerButtonState(els.inlineSendButton, state.controls.inlineSend);
   setComposerButtonState(els.stopButton, state.controls.stop);
   setComposerButtonState(els.queueButton, state.controls.queue);
   setComposerButtonState(els.steerButton, state.controls.steer);
+  if (startupBlocking) {
+    [els.inlineSendButton, els.stopButton, els.queueButton, els.steerButton, els.voiceButton].filter(Boolean).forEach((button) => { button.disabled = true; });
+  }
   els.composerDropZone?.classList.toggle('busy-draft', state.busyDraft);
   els.composerDropZone?.classList.toggle('can-steer', state.busyDraft && !state.controls.steer.hidden);
   if (els.sendButton) {
-    els.sendButton.disabled = state.mainButton.disabled;
+    els.sendButton.disabled = startupBlocking || state.mainButton.disabled;
     if (isConnected()) els.sendButton.textContent = state.mainButton.label;
   }
   renderQueueNotice();
@@ -2307,7 +2408,11 @@ function renderModelOptions(models = availableModels) {
     settings.model === DEFAULT_SETTINGS.model &&
     normalized.length > 1 &&
     normalized[0]?.id !== settings.model;
-  if (selectedIsDefaultFallback || !normalized.some((model) => model.id === settings.model)) {
+  const selectedModel = normalized.find((model) => model.id === settings.model);
+  if (selectedModel?.source === 'external') {
+    const runtimeModel = normalized.find((model) => isModelRuntimeSelectable(model));
+    settings.model = runtimeModel?.id || DEFAULT_SETTINGS.model;
+  } else if (selectedIsDefaultFallback || !selectedModel) {
     settings.model = normalized[0]?.id || DEFAULT_SETTINGS.model;
   }
   const selected = normalized.find((model) => model.id === settings.model) || normalized[0];
@@ -2398,6 +2503,10 @@ function renderModelMenu(query = els.modelSearchInput?.value || '') {
       button.className = `model-option ${model.selected ? 'selected' : ''} ${requestable ? '' : 'observed'}`.trim();
       button.dataset.modelId = model.id;
       button.title = runtimeStatus.detail;
+      if (model.source === 'external') {
+        button.disabled = true;
+        button.setAttribute('aria-disabled', 'true');
+      }
 
       const name = document.createElement('span');
       name.className = 'model-option-name';
@@ -2466,24 +2575,27 @@ function renderContextWindow(userText = els.input?.value || '') {
     modelContextTokens: stats.modelContextTokens,
   });
   const contextLimit = accounting.contextLimitTokens || stats.modelContextTokens;
-  const liveContextTokens = accounting.liveContextTokens;
   const runtimeLabel = [activeSessionRuntime.provider, activeSessionRuntime.model].filter(Boolean).join(' · ');
-  const sourceLabel = accounting.source === 'runtime'
-    ? `runtime${runtimeLabel ? ` · ${runtimeLabel}` : ''}`
-    : 'local next-prompt estimate';
-  const spendTokens = numericTokenField(activeSessionRuntime.lastTurnSpendTokens || activeSessionRuntime.usedTokens);
-  const spendLabel = spendTokens ? ` · last turn spend ${formatNumber(spendTokens)} tok` : '';
-  const meter = formatContextMeter({ estimatedTokens: liveContextTokens, modelContextTokens: contextLimit });
+  const meter = contextMeterDisplay({ accounting, runtimeLabel, modelContextTokens: contextLimit });
 
   els.contextCompactLabel.textContent = meter.compactLabel;
   els.contextPercentLabel.textContent = meter.percentLabel;
-  els.contextBarButton.title = contextLimit
-    ? `${formatNumber(liveContextTokens)} live context tokens from ${sourceLabel} of ${formatNumber(contextLimit)} available. Next prompt payload estimate: ${formatNumber(accounting.nextPromptTokens)} tokens${spendTokens ? `. Last turn spend: ${formatNumber(spendTokens)} tokens.` : '.'}`
-    : `${formatNumber(accounting.nextPromptTokens)} next prompt tokens from ${sourceLabel}. Selected/effective model did not report a max context window${spendTokens ? `. Last turn spend: ${formatNumber(spendTokens)} tokens.` : '.'}`;
-  els.contextUsageDetail.textContent = contextLimit
-    ? `${formatNumber(liveContextTokens)} / ${formatNumber(contextLimit)} live context · ${meter.percentLabel} · ${sourceLabel} · next prompt ${formatNumber(accounting.nextPromptTokens)} tok${spendLabel}`
-    : `${formatNumber(accounting.nextPromptTokens)} next prompt tokens · ${sourceLabel} · unknown max context${spendLabel}`;
+  els.contextBarButton.title = meter.title;
+  els.contextUsageDetail.textContent = meter.detail;
   els.contextMeterFill.style.width = contextLimit ? `${Math.min(100, Math.max(0, meter.percent))}%` : '0%';
+  const controls = contextControlState({ capabilities: gatewayCapabilities, percentUsed: meter.percent });
+  if (els.contextControlStatus) {
+    els.contextControlStatus.textContent = controls.compactRecommended
+      ? 'Context is getting full — compact when the runtime supports it.'
+      : controls.label;
+  }
+  if (els.contextCompactButton) {
+    els.contextCompactButton.disabled = !controls.canCompact || !settings.sessionId;
+    els.contextCompactButton.textContent = controls.compactRecommended ? 'Compact recommended' : 'Compact context';
+    els.contextCompactButton.title = controls.canCompact
+      ? 'Ask Hermes to compact this session context.'
+      : 'The connected Hermes runtime does not advertise native session compaction.';
+  }
 
   const pc = currentContext?.pageContext;
   if (contextScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY) {
@@ -2520,6 +2632,12 @@ function renderContextWindow(userText = els.input?.value || '') {
 function applySelectedModel(selectedId, { persist = true, keepOpen = false } = {}) {
   const nextId = selectedId || DEFAULT_SETTINGS.model;
   const selected = availableModels.find((model) => model.id === nextId);
+  if (selected?.source === 'external') {
+    selectedModelProvider = modelProviderLabel(selected);
+    renderModelMenu();
+    setStatus('warn', 'Custom model source is discovery-only', 'This model was discovered from a custom endpoint, but Hermes must expose it through the connected runtime before Browser can route requests to it.');
+    return;
+  }
   if (selected) selectedModelProvider = modelProviderLabel(selected);
   settings = {
     ...settings,
@@ -2538,11 +2656,20 @@ function applySelectedModel(selectedId, { persist = true, keepOpen = false } = {
   }
   if (persist) chrome.storage.local.set({ hermesBrowserSettings: settings });
   if (persist && selected) {
+    modelSelectionVersion += 1;
+    pendingModelRuntimeAck = {
+      version: modelSelectionVersion,
+      model: selected.rawModelId || selected.model || selected.id || nextId,
+      provider: selected.provider || '',
+      modelLabel: modelDisplayName(selected),
+      providerLabel: modelProviderLabel(selected),
+    };
     const status = modelRuntimeStatus(selected);
+    const detail = `${modelProviderLabel(selected)} · ${modelDisplayName(selected)} — requested; Hermes will confirm the effective runtime model on the next turn.`;
     if (!isModelRuntimeSelectable(selected)) {
-      setStatus('warn', 'Observed model selected', `${modelProviderLabel(selected)} · ${modelDisplayName(selected)}. ${status.detail}`);
+      setStatus('warn', 'Observed model requested', `${detail} ${status.detail}`);
     } else {
-      setStatus('ok', 'Hermes model selected', `${modelProviderLabel(selected)} · ${modelDisplayName(selected)}`);
+      setStatus('warn', 'Hermes model requested', detail);
     }
   }
 }
@@ -2649,6 +2776,22 @@ async function loadModels({ quiet = false, payload = null, refresh = false } = {
       }
     }
 
+    const customSources = normalizeExternalModelSourceList(settings.customModelSources || []);
+    if (customSources.length) {
+      const externalResult = await discoverModelsFromExternalSources({
+        sourceUrls: customSources,
+        fetchFn: globalThis.fetch?.bind(globalThis),
+        timeoutMs: 5000,
+      });
+      if (externalResult.models.length) {
+        registryModels = normalizeHermesModels(mergeModelsByRawId([registryModels, externalResult.models]), settings.model);
+        registrySource = registrySource ? `${registrySource}+external` : 'external';
+      } else if (!quiet && externalResult.results?.length) {
+        const failed = externalResult.results.filter((result) => !result.ok).length;
+        if (failed) setStatus('warn', 'Custom model source unavailable', `${failed} custom model source${failed === 1 ? '' : 's'} did not respond.`);
+      }
+    }
+
     const refreshDecision = modelCatalogRefreshDecision({
       previousSelectedModel,
       discoveredModels: registryModels,
@@ -2672,7 +2815,9 @@ async function loadModels({ quiet = false, payload = null, refresh = false } = {
           ? 'from Hermes dashboard'
           : registrySource === 'sessions'
             ? 'from session history'
-            : 'from local Hermes';
+            : registrySource.includes('external')
+              ? 'from Hermes plus custom model sources'
+              : 'from local Hermes';
       setStatus('ok', 'Hermes models synced', `${availableModels.length} model${availableModels.length === 1 ? '' : 's'} available ${sourceLabel}`);
     }
   } catch (error) {
@@ -3705,9 +3850,13 @@ function syncSettingsForm() {
   if (els.agentHostInput) els.agentHostInput.value = settings.agentDiscoveryHost || DEFAULT_SETTINGS.agentDiscoveryHost;
   if (els.agentSchemeInput) els.agentSchemeInput.value = normalizeAgentDiscoveryScheme(settings.agentDiscoveryScheme || DEFAULT_SETTINGS.agentDiscoveryScheme);
   if (els.agentPortsInput) els.agentPortsInput.value = getAgentPorts().join(',');
+  if (els.customModelSourcesInput) {
+    els.customModelSourcesInput.value = normalizeExternalModelSourceList(settings.customModelSources || []).join('\n');
+  }
   els.transcriptProviderInput.value = settings.transcriptProvider || DEFAULT_SETTINGS.transcriptProvider;
   renderCompatibilityPanel();
   renderConnectionSecurity();
+  renderRemoteDiagnostics(lastRemoteDiagnostic);
 }
 
 async function saveSettingsFromForm() {
@@ -3744,6 +3893,7 @@ async function saveSettingsFromForm() {
     agentDiscoveryHost: normalizeAgentDiscoveryHost(els.agentHostInput?.value || settings.agentDiscoveryHost || DEFAULT_SETTINGS.agentDiscoveryHost),
     agentDiscoveryScheme: normalizeAgentDiscoveryScheme(els.agentSchemeInput?.value || settings.agentDiscoveryScheme || DEFAULT_SETTINGS.agentDiscoveryScheme),
     agentPorts: parseAgentPortsInput(els.agentPortsInput?.value || '').length ? parseAgentPortsInput(els.agentPortsInput?.value || '') : getAgentPorts(),
+    customModelSources: normalizeExternalModelSourceList(els.customModelSourcesInput?.value?.split(/\n+/) || settings.customModelSources || []),
     transcriptProvider: els.transcriptProviderInput.value.trim() || DEFAULT_SETTINGS.transcriptProvider,
     colorMode: normalizeColorMode(settings.colorMode),
     appearanceTheme: normalizeAppearanceTheme(settings.appearanceTheme),
@@ -4087,6 +4237,51 @@ async function apiFetch(path, options = {}) {
   });
 }
 
+async function compactCurrentSessionContext() {
+  if (!settings.sessionId) {
+    setStatus('warn', 'No active session', 'Open or create a Hermes Browser Extension session before compacting context.');
+    return;
+  }
+  if (!gatewayCapabilities.sessionCompress) {
+    setStatus('warn', 'Context compaction unavailable', 'The connected Hermes runtime does not advertise native session compaction.');
+    return;
+  }
+  const button = els.contextCompactButton;
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Compacting…';
+  }
+  try {
+    const response = await apiFetch(`/api/sessions/${encodeSessionId(settings.sessionId)}/compress`, {
+      method: 'POST',
+      body: JSON.stringify({ source: 'hermes_browser' }),
+    });
+    const payload = await readJsonResponse(response);
+    if (!response.ok) {
+      throw new Error(payload?.error?.message || payload?.error || payload?.message || `Context compaction failed (${response.status})`);
+    }
+    const compactedSessionId = String(payload?.rotated_session_id || payload?.session_id || '').trim();
+    if (compactedSessionId && compactedSessionId !== settings.sessionId) {
+      settings = { ...settings, sessionId: compactedSessionId };
+      await chrome.storage.local.set({ hermesBrowserSettings: settings });
+    }
+    if (payload && typeof payload === 'object') {
+      applySessionRuntimeSnapshot({
+        session: { id: compactedSessionId || settings.sessionId, input_tokens: payload.last_prompt_tokens || payload.estimated_prompt_tokens || 0 },
+        runtime: payload.runtime,
+        sessionId: compactedSessionId || settings.sessionId,
+        source: 'context compaction',
+      });
+    }
+    setStatus('ok', 'Context compacted', payload?.summary || 'Hermes compacted the active session context.');
+    await loadSessions({ quiet: true });
+  } catch (error) {
+    setStatus('warn', 'Context compaction failed', error?.message || String(error));
+  } finally {
+    renderContextWindow();
+  }
+}
+
 function stopConnectionProbeLoop() {
   clearTimeout(connectionProbeTimer);
   connectionProbeTimer = null;
@@ -4312,14 +4507,40 @@ function currentModelProviderSlug() {
   return selected?.provider || '';
 }
 
+function runtimeValueMatches(requested = '', effective = '') {
+  const req = String(requested || '').trim().toLowerCase();
+  const got = String(effective || '').trim().toLowerCase();
+  if (!req || !got) return true;
+  return req === got || req.endsWith(`/${got}`) || got.endsWith(`/${req}`) || req.endsWith(`:${got}`) || got.endsWith(`:${req}`);
+}
+
+function applyPendingModelRuntimeAck(runtime = {}) {
+  if (!pendingModelRuntimeAck || !runtime || typeof runtime !== 'object') return;
+  const effectiveModel = runtime.model || runtime.model_id || runtime.modelId || runtime.effective_model || '';
+  const effectiveProvider = runtime.provider || runtime.provider_id || runtime.providerId || runtime.effective_provider || '';
+  if (!effectiveModel && !effectiveProvider) return;
+  const modelOk = runtimeValueMatches(pendingModelRuntimeAck.model, effectiveModel);
+  const providerOk = runtimeValueMatches(pendingModelRuntimeAck.provider, effectiveProvider);
+  const requestedLabel = [pendingModelRuntimeAck.providerLabel, pendingModelRuntimeAck.modelLabel].filter(Boolean).join(' · ');
+  const runtimeLabel = [effectiveProvider, effectiveModel].filter(Boolean).join(' · ');
+  if (modelOk && providerOk) {
+    setStatus('ok', 'Hermes model confirmed', runtimeLabel || requestedLabel || 'Runtime metadata matched the requested model.');
+  } else {
+    setStatus('warn', 'Model mismatch', `Requested ${requestedLabel || pendingModelRuntimeAck.model}; runtime used ${runtimeLabel || 'unknown model'}.`);
+  }
+  pendingModelRuntimeAck = null;
+}
+
 function applyTurnRuntimePayload(payload = {}) {
   if (!payload || typeof payload !== 'object') return;
+  const runtime = payload.runtime || {};
   applySessionRuntimeSnapshot({
     sessionId: payload.session_id || payload.sessionId || settings.sessionId,
     usage: payload.usage,
-    runtime: payload.runtime,
+    runtime,
     source: 'Hermes turn',
   });
+  applyPendingModelRuntimeAck(runtime);
 }
 
 async function ensureRemoteWsClient() {
@@ -4461,6 +4682,7 @@ async function streamSessionChat(prompt, onDelta, onTool, { signal, attachments:
     method: 'POST',
     signal,
     body: JSON.stringify({
+      client_runtime_version: modelSelectionVersion,
       model: currentModelRequestId(),
       provider: currentModelProviderSlug() || undefined,
       model_options: currentModelOptionsPayload(),
@@ -4485,6 +4707,7 @@ async function streamChatCompletions(prompt, onDelta, onTool, { signal, attachme
       'X-Hermes-Session-Key': settings.sessionId,
     },
     body: JSON.stringify({
+      client_runtime_version: modelSelectionVersion,
       model: currentModelRequestId(),
       provider: currentModelProviderSlug() || undefined,
       model_options: currentModelOptionsPayload(),
@@ -4706,6 +4929,12 @@ async function askHermes(userText, turnAttachments = [...attachments]) {
       : userText;
     const promptTabs = filterPromptTabs(context.tabs, contextScope);
     const selectedPromptTabs = Array.isArray(contextScope.selectedTabIds) ? promptTabs : undefined;
+    const contextHash = contextScope.mode === CONTEXT_SCOPE_MODES.CHAT_ONLY ? '' : browserContextPayloadHash({
+      activeTab: context.activeTab,
+      selectedTabs: selectedPromptTabs || promptTabs,
+      pageContext: context.pageContext,
+      settings,
+    });
     const prompt = buildHermesPrompt({
       userText: promptUserText,
       activeTab: context.activeTab,
@@ -4716,7 +4945,7 @@ async function askHermes(userText, turnAttachments = [...attachments]) {
       settings,
     });
 
-    const receipt = buildContextReceipt({ context, attachments: preparedAttachments, settings });
+    const receipt = buildContextReceipt({ context, attachments: preparedAttachments, settings, contextHash });
     const { node: userNode } = addMessage('user', displayUserText);
     appendContextReceipt(userNode, receipt);
     const { node } = addMessage('assistant', THINKING_PLACEHOLDER, { persist: false });
@@ -4834,6 +5063,8 @@ async function testConnection() {
       }
       updateConnectionPrompt();
       markGatewayReachable(`${normalizeGatewayUrl(settings.gatewayUrl)}${modelNote}`);
+      lastRemoteDiagnostic = null;
+      renderRemoteDiagnostics(null);
       setStatus('ok', 'Remote Hermes dashboard connected', `${normalizeGatewayUrl(settings.gatewayUrl)}${modelNote}`);
       settings = { ...settings, lastConnectionTestedAt: Date.now() };
       await chrome.storage.local.set({ hermesBrowserSettings: settings });
@@ -4843,13 +5074,36 @@ async function testConnection() {
     }
     const response = await apiFetch('/health', { method: 'GET' });
     const text = await response.text();
-    if (!response.ok) throw new Error(`${response.status}: ${text}`);
+    if (!response.ok) {
+      if (isRemoteMode()) {
+        const diagnostic = classifyRemoteGatewaySetup({
+          url: settings.gatewayUrl,
+          status: response.status,
+          location: response.headers?.get?.('location') || '',
+          body: text,
+        });
+        lastRemoteDiagnostic = diagnostic;
+        renderRemoteDiagnostics(diagnostic);
+        throw new Error(`${diagnostic.title}: ${diagnostic.detail}`);
+      }
+      throw new Error(`${response.status}: ${text}`);
+    }
     await loadGatewayCapabilities({ quiet: true, healthOk: true });
 
     const modelsResponse = await apiFetch('/v1/models', { method: 'GET' });
     const modelsPayload = await readJsonResponse(modelsResponse);
     let degradedDiagnostic = null;
     if (!modelsResponse.ok) {
+      if (isRemoteMode()) {
+        const remoteDiagnostic = classifyRemoteGatewaySetup({
+          url: settings.gatewayUrl,
+          healthOk: true,
+          status: modelsResponse.status,
+          body: JSON.stringify(modelsPayload).slice(0, 700),
+        });
+        lastRemoteDiagnostic = remoteDiagnostic;
+        renderRemoteDiagnostics(remoteDiagnostic);
+      }
       const diagnostic = classifyGatewayError(`Health OK, auth/model probe failed (${modelsResponse.status}): ${JSON.stringify(modelsPayload).slice(0, 500)}`);
       if (diagnostic.probeStatus === 'degraded') {
         degradedDiagnostic = diagnostic;
@@ -4873,6 +5127,8 @@ async function testConnection() {
         hasSessionRoutes ? normalizeGatewayUrl(settings.gatewayUrl) : `${normalizeGatewayUrl(settings.gatewayUrl)} - OpenAI-compatible fallback mode`,
       );
       markGatewayReachable(normalizeGatewayUrl(settings.gatewayUrl));
+      lastRemoteDiagnostic = null;
+      renderRemoteDiagnostics(null);
     }
 
     settings = { ...settings, lastConnectionTestedAt: Date.now() };
@@ -4882,7 +5138,21 @@ async function testConnection() {
     ok = true;
   } catch (error) {
     markGatewayUnreachable(error);
-    setStatus('error', 'Hermes gateway test failed', currentConnectionTroubleshooting() || error?.message || String(error));
+    if (isRemoteMode()) {
+      const diagnostic = classifyRemoteGatewaySetup({
+        url: settings.gatewayUrl,
+        error: error?.message || String(error),
+      });
+      if (diagnostic.kind !== 'unknown') {
+        lastRemoteDiagnostic = diagnostic;
+        renderRemoteDiagnostics(diagnostic);
+        setStatus('error', diagnostic.title, diagnostic.detail);
+      } else {
+        setStatus('error', 'Hermes gateway test failed', currentConnectionTroubleshooting() || error?.message || String(error));
+      }
+    } else {
+      setStatus('error', 'Hermes gateway test failed', currentConnectionTroubleshooting() || error?.message || String(error));
+    }
   } finally {
     els.testConnectionButton.disabled = false;
     flashTestConnectionResult(ok);
@@ -4953,6 +5223,15 @@ function bindEvents() {
   els.refreshSessionsButton.addEventListener('click', () => loadSessions());
   els.sessionSearchInput.addEventListener('input', () => renderSessionMenu(els.sessionSearchInput.value));
   els.closeSettingsButton.addEventListener('click', closeSettingsDialog);
+  els.copyRemoteEnvButton?.addEventListener('click', async () => {
+    const text = els.remoteEnvBlock?.textContent || remoteEnvBlockText();
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus('ok', 'Remote env copied', 'Paste this into the Hermes API-server environment on the remote machine.');
+    } catch (error) {
+      setStatus('warn', 'Could not copy env block', error?.message || String(error));
+    }
+  });
   els.settingsDialog.addEventListener('click', (event) => {
     if (event.target === els.settingsDialog) closeSettingsDialog();
   });
@@ -5107,6 +5386,9 @@ function bindEvents() {
     closeFloatingPanels();
     els.contextPopover.hidden = nextHidden;
     els.contextBarButton.setAttribute('aria-expanded', String(!nextHidden));
+  });
+  els.contextCompactButton?.addEventListener('click', () => {
+    compactCurrentSessionContext().catch((error) => setStatus('warn', 'Context compaction failed', error?.message || String(error)));
   });
   els.testConnectionButton.addEventListener('click', testConnection);
   els.clearTokenButton?.addEventListener('click', () => {
@@ -5350,29 +5632,83 @@ function bindEvents() {
   });
 }
 
-bindEvents();
-try {
-  await loadSettings({ restoreMessages: false });
-  const state = await probeGatewayLiveness({ quiet: true });
-  if (settings.apiKey && state.connected) {
+async function runStartupReadiness() {
+  startupReadiness = initialStartupReadiness(settings);
+  renderStartupReadiness();
+  try {
+    setStartupReadiness({ phase: 'settings', step: 'settings', status: 'active', detail: 'Loading Browser settings…' });
+    await loadSettings({ restoreMessages: false });
+    startupReadiness = reduceStartupReadiness(initialStartupReadiness(settings), {
+      phase: 'gateway-probe',
+      step: 'settings',
+      status: 'ready',
+      detail: 'Settings restored.',
+    });
+    renderStartupReadiness();
+
+    setStartupReadiness({ phase: 'gateway-probe', step: 'gateway', status: 'active', detail: `Checking ${normalizeGatewayUrl(settings.gatewayUrl)}…` });
+    const state = await probeGatewayLiveness({ quiet: true });
+    if (!settings.apiKey || !state.connected) {
+      const missingToken = !settings.apiKey;
+      setStartupReadiness({
+        step: 'gateway',
+        status: missingToken ? 'unconfigured' : (state.state === 'unreachable' ? 'unreachable' : 'error'),
+        detail: missingToken ? 'Add a Hermes API token or complete pairing to use full Hermes Browser mode.' : currentConnectionTroubleshooting(state),
+      });
+      renderModelOptions();
+      renderSessionMenu();
+      renderProfiles();
+      renderSkillSuggestions();
+      updateSessionLabel();
+      return;
+    }
+    setStartupReadiness({ step: 'gateway', status: 'ready', gateway: { connected: true, state: state.state }, detail: connectionStateTitle(state, currentGatewaySummary()) });
+
+    setStartupReadiness({ phase: 'capabilities', step: 'capabilities', status: 'active', detail: 'Loading runtime capability map…' });
     await loadGatewayCapabilities({ quiet: true, healthOk: true });
+    setStartupReadiness({
+      step: 'capabilities',
+      status: gatewayCapabilities.source === 'legacy' ? 'legacy' : 'ready',
+      detail: gatewayCapabilities.source === 'legacy' ? 'Legacy runtime detected; Browser-specific controls are capability-gated.' : 'Capabilities loaded.',
+    });
+
+    setStartupReadiness({ phase: 'models', step: 'models', status: 'active', detail: 'Loading model catalog…' });
     await loadModels({ quiet: true });
+    setStartupReadiness({ step: 'models', status: availableModels.length ? 'ready' : 'fallback', detail: availableModels.length ? `${availableModels.length} models loaded.` : 'Model catalog unavailable; using fallback runtime metadata.' });
+
+    const modelReady = selectedModelReadiness({ settings, availableModels, activeSessionRuntime });
+    setStartupReadiness({
+      step: 'selectedModel',
+      status: modelReady.status === 'error' && settings.model ? 'fallback' : modelReady.status,
+      detail: modelReady.detail,
+      selectedModel: modelReady.selectedModel,
+    });
+
+    setStartupReadiness({ phase: 'skills', step: 'skills', status: 'active', detail: 'Loading skills…' });
     await loadSkills({ quiet: true });
+    setStartupReadiness({ step: 'skills', status: gatewayCapabilities.skills ? 'ready' : 'skipped', detail: gatewayCapabilities.skills ? `${availableSkills.length} skills available.` : 'Skills route unavailable on this runtime.' });
+
+    setStartupReadiness({ phase: 'profiles', step: 'profiles', status: 'active', detail: 'Loading profiles…' });
     await loadProfiles({ quiet: true });
+    setStartupReadiness({ step: 'profiles', status: gatewayCapabilities.profiles ? 'ready' : 'skipped', detail: gatewayCapabilities.profiles ? `${availableProfiles.length} profiles available.` : 'Profiles route unavailable on this runtime.' });
+
+    setStartupReadiness({ phase: 'sessions', step: 'sessions', status: 'active', detail: 'Loading sessions…' });
     await loadSessions({ quiet: true });
+    setStartupReadiness({ step: 'sessions', status: sessionRoutesAvailable === false ? 'fallback' : 'ready', detail: sessionRoutesAvailable === false ? 'Session routes unavailable; using chat fallback.' : `${availableSessions.length} sessions loaded.` });
+
+    setStartupReadiness({ phase: 'session-ready', step: 'sessionBinding', status: 'active', detail: 'Binding Browser panel to a Hermes session…' });
     await initializeSessionForPanelOpen({ focus: false });
+    setStartupReadiness({ step: 'sessionBinding', status: sessionRoutesAvailable === false ? 'fallback' : 'ready', detail: settings.sessionId ? `Session ready: ${settings.sessionId}` : 'Chat fallback ready.' });
     await consumePendingVoiceDraft();
-  } else {
-    renderModelOptions();
-    renderSessionMenu();
-    renderProfiles();
-    renderSkillSuggestions();
-    updateSessionLabel();
+  } catch (error) {
+    setStartupReadiness({ phase: 'error', step: 'gateway', status: 'error', blockingError: error?.message || String(error), detail: error?.message || String(error) });
+    setStatus('error', 'Startup readiness failed', error?.message || String(error));
+    renderEmptyState();
   }
-} catch (error) {
-  setStatus('error', 'Settings failed to load', error?.message || String(error));
-  renderEmptyState();
 }
+
+bindEvents();
+await runStartupReadiness();
 try {
   await refreshContext();
 } catch (error) {
