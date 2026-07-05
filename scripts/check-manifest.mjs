@@ -26,6 +26,7 @@ const requiredFiles = [
   'request-permissions.js',
   'voice-dictation.html',
   'voice-dictation.js',
+  'lib/browser-context-protocol.mjs',
   'lib/common.mjs',
   'assets/fonts/Sigurd-Variable.woff2',
   'assets/fonts/CourierPrime-Regular.woff2',
