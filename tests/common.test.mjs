@@ -110,6 +110,22 @@ test('sidepanel startup initializes a fresh panel-open session instead of auto-r
   assert.doesNotMatch(source, /await ensureSessionForActiveScope\(\{ focus: false \}\);\s*await consumePendingVoiceDraft/);
 });
 
+test('bottom dock model and context popovers are portaled above the scroll container', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../extension/sidepanel.css', import.meta.url), 'utf8');
+  const dockRule = css.match(/\.bottom-dock\s*\{[\s\S]*?\}/)?.[0] || '';
+  const floatingRule = css.match(/\.model-menu,\s*\n\.context-popover\s*\{[\s\S]*?\}/)?.[0] || '';
+
+  assert.match(dockRule, /overflow-y:\s*auto/);
+  assert.match(source, /shell:\s*\$\('\.shell'\)/);
+  assert.match(source, /bottomDock:\s*\$\('\.bottom-dock'\)/);
+  assert.match(source, /function portalDockFloatingPanels\(\)/);
+  assert.match(source, /for \(const panel of \[els\.modelMenu, els\.contextPopover\]\)/);
+  assert.match(source, /parent\.appendChild\(panel\)/);
+  assert.match(source, /--hermes-bottom-dock-height/);
+  assert.match(floatingRule, /bottom:\s*calc\(var\(--hermes-bottom-dock-height, 0px\) \+ 6px\)/);
+});
+
 test('side panel defaults to full Hermes tool access instead of read-only/no-tool mode', () => {
   const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
   const common = readFileSync(new URL('../extension/lib/common.mjs', import.meta.url), 'utf8');

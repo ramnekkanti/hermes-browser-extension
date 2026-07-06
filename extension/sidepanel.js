@@ -129,6 +129,8 @@ const $ = (selector) => document.querySelector(selector);
 const sidePanelParams = parseSidePanelParams(globalThis.location?.search || '');
 
 const els = {
+  shell: $('.shell'),
+  bottomDock: $('.bottom-dock'),
   appScroll: $('#appScroll'),
   startupScreen: $('#startupScreen'),
   startupTitle: $('#startupTitle'),
@@ -281,6 +283,7 @@ let dictating = false;
 let dictationBaseText = '';
 let dictationFinalText = '';
 let sessionRoutesAvailable = null;
+let bottomDockResizeObserver = null;
 
 let activeSessionRuntime = {
   sessionId: '',
@@ -2707,6 +2710,7 @@ function applySelectedModel(selectedId, { persist = true, keepOpen = false } = {
   sessionRoutesAvailable = null;
   renderModelOptions(availableModels);
   if (keepOpen) {
+    updateDockFloatingAnchor();
     els.modelMenu.hidden = false;
     els.modelMenuButton.setAttribute('aria-expanded', 'true');
     els.modelSearchInput.focus();
@@ -5240,12 +5244,39 @@ function closeFloatingPanels() {
   els.contextBarButton.setAttribute('aria-expanded', 'false');
 }
 
+function updateDockFloatingAnchor() {
+  if (!els.bottomDock) return;
+  const rect = els.bottomDock.getBoundingClientRect();
+  const viewportHeight = globalThis.innerHeight || document.documentElement.clientHeight || rect.bottom || 0;
+  const dockHeight = Math.max(0, Math.round(viewportHeight - rect.top));
+  document.documentElement.style.setProperty('--hermes-bottom-dock-height', `${dockHeight}px`);
+}
+
+function portalDockFloatingPanels() {
+  const parent = els.shell || document.body;
+  for (const panel of [els.modelMenu, els.contextPopover]) {
+    if (panel && panel.parentElement !== parent) parent.appendChild(panel);
+  }
+  updateDockFloatingAnchor();
+}
+
+function observeDockFloatingAnchor() {
+  updateDockFloatingAnchor();
+  globalThis.addEventListener?.('resize', updateDockFloatingAnchor);
+  if (!bottomDockResizeObserver && typeof globalThis.ResizeObserver === 'function' && els.bottomDock) {
+    bottomDockResizeObserver = new globalThis.ResizeObserver(updateDockFloatingAnchor);
+    bottomDockResizeObserver.observe(els.bottomDock);
+  }
+}
+
 function eventPathContains(event, node) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
   return path.includes(node) || node.contains(event.target);
 }
 
 function bindEvents() {
+  portalDockFloatingPanels();
+  observeDockFloatingAnchor();
   els.settingsButton.addEventListener('click', openSettingsDialog);
   els.manualSettingsButton.addEventListener('click', openSettingsDialog);
   [els.modelMenu, els.sessionMenu, els.contextPopover, els.attachMenu, els.skillMenu].filter(Boolean).forEach((panel) => {
@@ -5382,6 +5413,7 @@ function bindEvents() {
     event.stopPropagation();
     const nextHidden = !els.modelMenu.hidden;
     closeFloatingPanels();
+    updateDockFloatingAnchor();
     els.modelMenu.hidden = nextHidden;
     els.modelMenuButton.setAttribute('aria-expanded', String(!nextHidden));
     if (!nextHidden) {
@@ -5453,6 +5485,7 @@ function bindEvents() {
     event.stopPropagation();
     const nextHidden = !els.contextPopover.hidden;
     closeFloatingPanels();
+    updateDockFloatingAnchor();
     els.contextPopover.hidden = nextHidden;
     els.contextBarButton.setAttribute('aria-expanded', String(!nextHidden));
   });
