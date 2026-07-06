@@ -2023,6 +2023,8 @@ test('settings text-size option has defaults, normalization, storage, and root d
   assert.match(css, /html\[data-hermes-text-size\] \.appearance-row strong/);
   assert.match(css, /\.bottom-dock \{[\s\S]*?max-height:\s*min\(52vh, 320px\)/);
   assert.match(css, /\.bottom-dock \{[\s\S]*?overflow-y:\s*auto/);
+  assert.match(css, /\.bottom-dock::-webkit-scrollbar,\s*\n\.settings-dialog::-webkit-scrollbar/);
+  assert.match(css, /\.bottom-dock::-webkit-scrollbar-thumb,\s*\n\.settings-dialog::-webkit-scrollbar-thumb/);
 });
 
 test('Hermes compatibility settings panel is native-collapsible and defaults closed', () => {

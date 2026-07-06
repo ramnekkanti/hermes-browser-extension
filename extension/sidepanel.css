@@ -470,6 +470,7 @@ button { text-transform: uppercase; letter-spacing: 0.14em; }
 }
 .app-scroll::-webkit-scrollbar,
 .messages::-webkit-scrollbar,
+.bottom-dock::-webkit-scrollbar,
 .settings-dialog::-webkit-scrollbar,
 textarea::-webkit-scrollbar,
 .quick-more-menu::-webkit-scrollbar,
@@ -487,6 +488,7 @@ textarea::-webkit-scrollbar,
 }
 .app-scroll::-webkit-scrollbar-thumb,
 .messages::-webkit-scrollbar-thumb,
+.bottom-dock::-webkit-scrollbar-thumb,
 .settings-dialog::-webkit-scrollbar-thumb,
 textarea::-webkit-scrollbar-thumb,
 .quick-more-menu::-webkit-scrollbar-thumb,
