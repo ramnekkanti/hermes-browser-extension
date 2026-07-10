@@ -60,6 +60,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   thinkingEnabled: true,
   fastMode: false,
   reasoningEffort: 'xhigh',
+  extensionPreferredModelOptions: Object.freeze({
+    thinkingEnabled: true,
+    reasoningEffort: 'xhigh',
+    fastMode: false,
+    serviceTier: null,
+  }),
+  sessionModelOptionBindings: Object.freeze({}),
   modelOptionsVersion: 2,
   contextDepth: 'normal',
   includeTabs: true,
@@ -1049,6 +1056,100 @@ export function normalizeFastMode(value = DEFAULT_SETTINGS.fastMode) {
   return false;
 }
 
+export function normalizeAcknowledgedModelOptions(value = null) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const reasoning = value.reasoning && typeof value.reasoning === 'object' ? value.reasoning : {};
+  const rawEffort = String(reasoning.effort || value.reasoning_effort || value.reasoningEffort || '').trim().toLowerCase();
+  const thinkingEnabled = typeof reasoning.enabled === 'boolean'
+    ? reasoning.enabled
+    : (typeof value.thinkingEnabled === 'boolean' ? value.thinkingEnabled : rawEffort !== 'none');
+  const serviceTier = value.service_tier ?? value.serviceTier ?? null;
+  const fastValue = Object.hasOwn(value, 'fast')
+    ? value.fast
+    : (Object.hasOwn(value, 'fastMode') ? value.fastMode : serviceTier === 'priority');
+  const fastMode = normalizeFastMode(fastValue);
+  return {
+    thinkingEnabled,
+    reasoningEffort: rawEffort && rawEffort !== 'none'
+      ? normalizeReasoningEffort(rawEffort)
+      : (thinkingEnabled ? DEFAULT_SETTINGS.reasoningEffort : null),
+    fastMode,
+    serviceTier: serviceTier == null ? (fastMode ? 'priority' : null) : String(serviceTier),
+  };
+}
+
+export function resolveAcknowledgedSessionModelOptions({
+  sessionOptions = null,
+  storedOptions = null,
+} = {}) {
+  const acknowledged = normalizeAcknowledgedModelOptions(sessionOptions);
+  const stored = normalizeAcknowledgedModelOptions(storedOptions);
+  if (acknowledged && !acknowledged.thinkingEnabled && !acknowledged.reasoningEffort && stored?.reasoningEffort) {
+    return { ...acknowledged, reasoningEffort: stored.reasoningEffort };
+  }
+  return acknowledged || stored;
+}
+
+export function resolveBrowserEffectiveModelOptions({
+  sessionId = '',
+  sessionModelOptionBindings = {},
+  extensionPreferredModelOptions = null,
+} = {}) {
+  const sessionOptions = sessionId
+    ? normalizeAcknowledgedModelOptions(sessionModelOptionBindings?.[sessionId])
+    : null;
+  return sessionOptions
+    || normalizeAcknowledgedModelOptions(extensionPreferredModelOptions)
+    || normalizeAcknowledgedModelOptions({
+      thinkingEnabled: DEFAULT_SETTINGS.thinkingEnabled,
+      reasoningEffort: DEFAULT_SETTINGS.reasoningEffort,
+      fastMode: DEFAULT_SETTINGS.fastMode,
+      serviceTier: null,
+    });
+}
+
+export function updateBrowserModelOptionScope({
+  options = null,
+  sessionId = '',
+  sessionModelOptionBindings = {},
+} = {}) {
+  const binding = normalizeAcknowledgedModelOptions(options);
+  const nextBindings = {
+    ...(sessionModelOptionBindings && typeof sessionModelOptionBindings === 'object'
+      ? sessionModelOptionBindings
+      : {}),
+  };
+  if (binding && sessionId) nextBindings[String(sessionId)] = binding;
+  return {
+    extensionPreferredModelOptions: binding,
+    sessionModelOptionBindings: nextBindings,
+  };
+}
+
+export function modelOptionsRuntimeAckState({ requested = null, runtime = {} } = {}) {
+  const rawEffective = runtime?.model_options || runtime?.modelOptions || null;
+  if (!rawEffective || typeof rawEffective !== 'object') {
+    return { state: 'pending', detail: 'Waiting for Hermes runtime option metadata.' };
+  }
+  const requestedOptions = normalizeAcknowledgedModelOptions(requested);
+  const effectiveOptions = normalizeAcknowledgedModelOptions(rawEffective);
+  if (!requestedOptions || !effectiveOptions) {
+    return { state: 'pending', detail: 'Waiting for Hermes runtime option metadata.' };
+  }
+  const matches = requestedOptions.thinkingEnabled === effectiveOptions.thinkingEnabled
+    && (!requestedOptions.thinkingEnabled || requestedOptions.reasoningEffort === effectiveOptions.reasoningEffort)
+    && requestedOptions.fastMode === effectiveOptions.fastMode
+    && requestedOptions.serviceTier === effectiveOptions.serviceTier;
+  const effectiveEffort = effectiveOptions.thinkingEnabled ? ` · ${reasoningEffortLabel(effectiveOptions.reasoningEffort)}` : '';
+  const requestedEffort = requestedOptions.thinkingEnabled ? ` · ${reasoningEffortLabel(requestedOptions.reasoningEffort)}` : '';
+  const detail = `Thinking ${effectiveOptions.thinkingEnabled ? 'on' : 'off'}${effectiveEffort} · Fast ${effectiveOptions.fastMode ? 'on' : 'off'}`;
+  if (matches) return { state: 'confirmed', detail };
+  return {
+    state: 'mismatch',
+    detail: `Requested Thinking ${requestedOptions.thinkingEnabled ? 'on' : 'off'}${requestedEffort} · Fast ${requestedOptions.fastMode ? 'on' : 'off'}, but Hermes acknowledged ${detail}.`,
+  };
+}
+
 export function buildHermesModelOptions(settings = DEFAULT_SETTINGS) {
   const thinkingEnabled = settings.thinkingEnabled !== false;
   const reasoningEffort = normalizeReasoningEffort(settings.reasoningEffort);
@@ -1677,6 +1778,7 @@ export function normalizeHermesSessions(payload = {}) {
       model: String(session.model || ''),
       provider: String(session.provider || session.provider_id || session.providerId || ''),
       rawModelId: String(session.rawModelId || session.raw_model_id || session.model || ''),
+      modelOptions: normalizeAcknowledgedModelOptions(session.model_options || session.modelOptions),
       inputTokens: Number(session.input_tokens || session.inputTokens || 0),
       outputTokens: Number(session.output_tokens || session.outputTokens || 0),
       cacheReadTokens: Number(session.cache_read_tokens || session.cacheReadTokens || 0),

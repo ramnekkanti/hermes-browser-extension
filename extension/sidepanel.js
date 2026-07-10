@@ -40,6 +40,7 @@ import {
   modelRefreshControlState,
   modelRuntimeStatus,
   modelRuntimeAckState,
+  modelOptionsRuntimeAckState,
   normalizeGitCommit,
   normalizeHermesModels,
   normalizeHermesProfiles,
@@ -69,10 +70,13 @@ import {
   shouldAutoFlushQueuedTurn,
   shouldCreateFreshSessionOnOpen,
   resolveAcknowledgedSessionModelBinding,
+  resolveAcknowledgedSessionModelOptions,
   resolveBrowserEffectiveModel,
+  resolveBrowserEffectiveModelOptions,
   resolveCatalogModelIdForBinding,
   skillSuggestionsForInput,
   updateBrowserModelScope,
+  updateBrowserModelOptionScope,
 } from './lib/common.mjs';
 import { extractYouTubeVideoId } from './lib/transcript.mjs';
 import { buildDashboardWsUrl, createGatewayClient, WS_EVENTS, WS_METHODS } from './lib/gateway-ws.mjs';
@@ -286,6 +290,7 @@ let availableProfiles = [];
 let attachments = [];
 let selectedModelProvider = '';
 let modelSelectionVersion = 0;
+let modelOptionSelectionVersion = 0;
 let pendingModelRuntimeAck = null;
 let lastRemoteDiagnostic = null;
 let lastVisibleStatus = null;
@@ -2017,10 +2022,13 @@ function syncActiveSessionRuntimeFromList() {
   if (!session) return;
   const previousModel = settings.model;
   const previousBinding = JSON.stringify(settings.sessionModelBindings?.[session.id] || null);
+  const previousOptionsBinding = JSON.stringify(settings.sessionModelOptionBindings?.[session.id] || null);
   applyModelBindingForSession(session);
+  applyModelOptionsForSession(session);
   applySessionRuntimeSnapshot({ session, sessionId: session.id, source: 'Hermes session' });
   const nextBinding = JSON.stringify(settings.sessionModelBindings?.[session.id] || null);
-  if (settings.model !== previousModel || nextBinding !== previousBinding) {
+  const nextOptionsBinding = JSON.stringify(settings.sessionModelOptionBindings?.[session.id] || null);
+  if (settings.model !== previousModel || nextBinding !== previousBinding || nextOptionsBinding !== previousOptionsBinding) {
     void chrome.storage.local.set({ hermesBrowserSettings: settings });
     renderModelOptions(availableModels);
   }
@@ -2580,6 +2588,28 @@ function applyModelBindingForSession(session = {}) {
   return settings;
 }
 
+function applyModelOptionsForSession(session = {}) {
+  const sessionId = session?.id || settings.sessionId;
+  const options = resolveAcknowledgedSessionModelOptions({
+    sessionOptions: session?.modelOptions,
+    storedOptions: settings.sessionModelOptionBindings?.[sessionId],
+  });
+  if (!options) return settings;
+  settings = {
+    ...settings,
+    thinkingEnabled: options.thinkingEnabled,
+    reasoningEffort: options.reasoningEffort,
+    fastMode: options.fastMode,
+    sessionModelOptionBindings: {
+      ...(settings.sessionModelOptionBindings && typeof settings.sessionModelOptionBindings === 'object'
+        ? settings.sessionModelOptionBindings
+        : {}),
+      [sessionId]: options,
+    },
+  };
+  return settings;
+}
+
 function preferredModelBindingForNewSession() {
   return normalizeBrowserModelBinding(settings.extensionPreferredModel)
     || modelBindingFromModel(availableModels.find((model) => model.id === settings.model))
@@ -2753,10 +2783,113 @@ function persistModelRuntimeOptions() {
 }
 
 function setModelRuntimeOption(key, value) {
-  settings = { ...settings, [key]: value };
+  const previousOptions = resolveBrowserEffectiveModelOptions({
+    sessionId: settings.sessionId,
+    sessionModelOptionBindings: settings.sessionModelOptionBindings,
+    extensionPreferredModelOptions: settings.extensionPreferredModelOptions,
+  });
+  const previousPreferredModelOptions = settings.extensionPreferredModelOptions;
+  const previousSessionModelOptionBindings = { ...(settings.sessionModelOptionBindings || {}) };
+  const nextSettings = { ...settings, [key]: value };
+  const fastMode = normalizeFastMode(nextSettings.fastMode);
+  const scope = updateBrowserModelOptionScope({
+    options: {
+      thinkingEnabled: nextSettings.thinkingEnabled !== false,
+      reasoningEffort: normalizeReasoningEffort(nextSettings.reasoningEffort),
+      fastMode,
+      serviceTier: fastMode ? 'priority' : null,
+    },
+    sessionId: settings.sessionId,
+    sessionModelOptionBindings: settings.sessionModelOptionBindings || {},
+  });
+  settings = {
+    ...nextSettings,
+    fastMode,
+    extensionPreferredModelOptions: scope.extensionPreferredModelOptions,
+    sessionModelOptionBindings: scope.sessionModelOptionBindings,
+  };
   renderModelRuntimeOptions();
   updateModelButtonMeta();
   persistModelRuntimeOptions();
+  modelOptionSelectionVersion += 1;
+  void syncSessionModelOptions({
+    sessionId: settings.sessionId,
+    optionVersion: modelOptionSelectionVersion,
+    requestedOptions: scope.extensionPreferredModelOptions,
+    previousOptions,
+    previousPreferredModelOptions,
+    previousSessionModelOptionBindings,
+  });
+}
+
+async function fetchAcknowledgedSessionModelOptions(sessionId) {
+  if (!sessionId || isRemoteWsMode()) return null;
+  const response = await apiFetch(`/api/sessions/${encodeSessionId(sessionId)}`);
+  const payload = await readJsonResponse(response);
+  if (!response.ok) return null;
+  return normalizeHermesSessions({ data: [payload?.session || payload] })[0]?.modelOptions || null;
+}
+
+async function syncSessionModelOptions({
+  sessionId,
+  optionVersion,
+  requestedOptions,
+  previousOptions,
+  previousPreferredModelOptions,
+  previousSessionModelOptionBindings,
+} = {}) {
+  if (!sessionId) return { state: 'pending' };
+  if (sessionId !== settings.sessionId) return { state: 'stale' };
+  if (isRemoteWsMode()) {
+    setStatus('warn', 'Hermes model options pending', 'Dashboard WebSocket does not expose an existing-session model-options update yet. These options will apply to the next new session.');
+    return { state: 'pending' };
+  }
+  const supportsLock = Boolean(gatewayCapabilities?.sessionModelLock || gatewayCapabilities?.endpoints?.session_model_lock);
+  if (!supportsLock) {
+    setStatus('warn', 'Hermes model options pending', 'The connected runtime will receive these options on the next turn, but does not expose an acknowledgement endpoint.');
+    return { state: 'pending' };
+  }
+  setStatus('warn', 'Hermes model options pending', 'Waiting for the session resource to confirm Thinking, effort, and Fast mode.');
+  try {
+    const payload = await requestSessionModelLock(currentSelectedModel(), { sessionId });
+    if (optionVersion !== modelOptionSelectionVersion) return { state: 'stale' };
+    if (sessionId !== settings.sessionId) return { state: 'stale' };
+    const acknowledgedSessionOptions = await fetchAcknowledgedSessionModelOptions(sessionId);
+    if (optionVersion !== modelOptionSelectionVersion) return { state: 'stale' };
+    if (sessionId !== settings.sessionId) return { state: 'stale' };
+    const acknowledged = acknowledgedSessionOptions
+      || payload?.runtime?.model_options
+      || payload?.model_options
+      || null;
+    const ack = modelOptionsRuntimeAckState({
+      requested: requestedOptions,
+      runtime: acknowledged ? { model_options: acknowledged } : payload?.runtime || {},
+    });
+    if (ack.state === 'confirmed') {
+      setStatus('ok', 'Hermes model options confirmed', ack.detail);
+    } else if (ack.state === 'mismatch') {
+      setStatus('warn', 'Hermes model options mismatch', ack.detail);
+    } else {
+      setStatus('warn', 'Hermes model options pending', ack.detail);
+    }
+    return ack;
+  } catch (error) {
+    if (optionVersion !== modelOptionSelectionVersion) return { state: 'stale' };
+    if (sessionId !== settings.sessionId) return { state: 'stale' };
+    const rollback = previousOptions || DEFAULT_SETTINGS.extensionPreferredModelOptions;
+    settings = {
+      ...settings,
+      thinkingEnabled: rollback.thinkingEnabled,
+      reasoningEffort: rollback.reasoningEffort,
+      fastMode: rollback.fastMode,
+      extensionPreferredModelOptions: previousPreferredModelOptions,
+      sessionModelOptionBindings: previousSessionModelOptionBindings,
+    };
+    await chrome.storage.local.set({ hermesBrowserSettings: settings });
+    renderModelOptions(availableModels);
+    setStatus('error', 'Hermes model options failed', error?.message || String(error));
+    return { state: 'failed', error };
+  }
 }
 
 function renderContextWindow(userText = els.input?.value || '') {
@@ -2888,9 +3021,9 @@ function applySelectedModel(selectedId, { persist = true, keepOpen = false } = {
   }
 }
 
-async function requestSessionModelLock(selected = currentSelectedModel()) {
-  if (!settings.sessionId) throw new Error('No active Hermes session for model lock.');
-  const response = await apiFetch(`/api/sessions/${encodeSessionId(settings.sessionId)}/model`, {
+async function requestSessionModelLock(selected = currentSelectedModel(), { sessionId = settings.sessionId } = {}) {
+  if (!sessionId) throw new Error('No active Hermes session for model lock.');
+  const response = await apiFetch(`/api/sessions/${encodeSessionId(sessionId)}/model`, {
     method: 'POST',
     body: JSON.stringify({
       client_runtime_version: modelSelectionVersion,
@@ -3852,8 +3985,17 @@ function makeBrowserSessionTitle(date = new Date()) {
   return `Hermes Browser Extension · ${stamp}`;
 }
 
+function preferredModelOptionsForNewSession() {
+  return resolveBrowserEffectiveModelOptions({
+    sessionId: '',
+    sessionModelOptionBindings: {},
+    extensionPreferredModelOptions: settings.extensionPreferredModelOptions,
+  });
+}
+
 async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), focus = true } = {}) {
   const preferredBinding = preferredModelBindingForNewSession();
+  const preferredOptions = preferredModelOptionsForNewSession();
   const preferredModel = modelForBinding(preferredBinding);
   const requestModel = preferredModel?.rawModelId || preferredBinding?.rawModelId || preferredBinding?.modelId || settings.model || DEFAULT_SETTINGS.model;
   const requestProvider = preferredModel?.provider || preferredBinding?.provider || '';
@@ -3863,8 +4005,8 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
       title,
       model: requestModel,
       provider: requestProvider || undefined,
-      reasoning_effort: normalizeReasoningEffort(settings.reasoningEffort),
-      fast: normalizeFastMode(settings.fastMode),
+      reasoning_effort: preferredOptions.thinkingEnabled ? preferredOptions.reasoningEffort : 'none',
+      fast: preferredOptions.fastMode,
     });
     const id = result?.session_id;
     if (!id) throw new Error('Dashboard did not return a session id.');
@@ -3882,6 +4024,10 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
       sessionModelBindings: {
         ...(settings.sessionModelBindings || {}),
         [id]: preferredBinding,
+      },
+      sessionModelOptionBindings: {
+        ...(settings.sessionModelOptionBindings || {}),
+        [id]: preferredOptions,
       },
       modelScopeVersion: DEFAULT_SETTINGS.modelScopeVersion,
     };
@@ -3904,6 +4050,7 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
       source: settings.sessionSource || DEFAULT_SETTINGS.sessionSource,
       model: requestModel,
       provider: requestProvider || undefined,
+      model_options: buildHermesModelOptions(preferredOptions),
       system_prompt: HERMES_BROWSER_SYSTEM_PROMPT,
     }),
   });
@@ -3921,6 +4068,10 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
     sessionModelBindings: {
       ...(settings.sessionModelBindings || {}),
       [session.id]: preferredBinding,
+    },
+    sessionModelOptionBindings: {
+      ...(settings.sessionModelOptionBindings || {}),
+      [session.id]: preferredOptions,
     },
     modelScopeVersion: DEFAULT_SETTINGS.modelScopeVersion,
   };
@@ -3951,6 +4102,8 @@ async function openHermesSession(session) {
   }
   settings = { ...settings, sessionId: session.id, sessionTitle: session.title || session.id };
   applyModelBindingForSession(session);
+  applyModelOptionsForSession(session);
+  renderModelOptions(availableModels);
   activeSessionRuntime = { ...activeSessionRuntime, sessionId: session.id, usedTokens: 0, inputTokens: 0, outputTokens: 0, model: '', provider: '', source: '' };
   sessionRoutesAvailable = true;
   await chrome.storage.local.set({ hermesBrowserSettings: settings });
@@ -4434,6 +4587,7 @@ async function loadSettings({ restoreMessages = false } = {}) {
   const stored = await chrome.storage.local.get(['hermesBrowserSettings', messageKey]);
   const storedSettings = stored.hermesBrowserSettings || {};
   const migrateDesktopOptionDefaults = !storedSettings.modelOptionsVersion && storedSettings.reasoningEffort === 'medium';
+  const migrateModelOptionScope = !storedSettings.extensionPreferredModelOptions || !storedSettings.sessionModelOptionBindings;
   settings = { ...DEFAULT_SETTINGS, ...storedSettings };
   settings = {
     ...settings,
@@ -4455,6 +4609,18 @@ async function loadSettings({ restoreMessages = false } = {}) {
     sessionModelBindings: Object.fromEntries(Object.entries(settings.sessionModelBindings && typeof settings.sessionModelBindings === 'object' ? settings.sessionModelBindings : {})
       .map(([sessionId, binding]) => [sessionId, normalizeBrowserModelBinding(binding)])
       .filter(([, binding]) => Boolean(binding))),
+    extensionPreferredModelOptions: resolveAcknowledgedSessionModelOptions({
+      sessionOptions: settings.extensionPreferredModelOptions,
+      storedOptions: {
+        thinkingEnabled: settings.thinkingEnabled !== false,
+        reasoningEffort: migrateDesktopOptionDefaults ? DEFAULT_SETTINGS.reasoningEffort : normalizeReasoningEffort(settings.reasoningEffort),
+        fastMode: normalizeFastMode(settings.fastMode),
+        serviceTier: normalizeFastMode(settings.fastMode) ? 'priority' : null,
+      },
+    }),
+    sessionModelOptionBindings: Object.fromEntries(Object.entries(settings.sessionModelOptionBindings && typeof settings.sessionModelOptionBindings === 'object' ? settings.sessionModelOptionBindings : {})
+      .map(([sessionId, options]) => [sessionId, resolveAcknowledgedSessionModelOptions({ sessionOptions: options })])
+      .filter(([, options]) => Boolean(options))),
     modelScopeVersion: DEFAULT_SETTINGS.modelScopeVersion,
   };
   const effectiveBinding = resolveBrowserEffectiveModel({
@@ -4467,8 +4633,18 @@ async function loadSettings({ restoreMessages = false } = {}) {
     settings.model = effectiveBinding.modelId;
     settings.modelContextTokens = effectiveBinding.contextTokens || settings.modelContextTokens || 0;
   }
+  const effectiveOptions = resolveBrowserEffectiveModelOptions({
+    sessionId: settings.sessionId,
+    sessionModelOptionBindings: settings.sessionModelOptionBindings,
+    extensionPreferredModelOptions: settings.extensionPreferredModelOptions,
+  });
+  if (effectiveOptions) {
+    settings.thinkingEnabled = effectiveOptions.thinkingEnabled;
+    settings.reasoningEffort = effectiveOptions.reasoningEffort;
+    settings.fastMode = effectiveOptions.fastMode;
+  }
   applyAppearanceSettings();
-  if (migrateDesktopOptionDefaults) {
+  if (migrateDesktopOptionDefaults || migrateModelOptionScope) {
     await chrome.storage.local.set({ hermesBrowserSettings: settings });
   }
   messages = restoreMessages && Array.isArray(stored[messageKey]) ? stored[messageKey] : [];

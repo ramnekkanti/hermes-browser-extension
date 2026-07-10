@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import * as common from '../extension/lib/common.mjs';
 
 import {
   DEFAULT_SETTINGS,
@@ -616,7 +617,7 @@ test('model selection stays pending until runtime metadata confirms or warns', (
   assert.match(source, /let pendingModelRuntimeAck\s*=\s*null/);
   assert.match(source, /client_runtime_version:\s*modelSelectionVersion/);
   assert.match(source, /Hermes model confirmed|Model mismatch/);
-  assert.match(source, /\/api\/sessions\/\$\{encodeSessionId\(settings\.sessionId\)\}\/model/);
+  assert.match(source, /\/api\/sessions\/\$\{encodeSessionId\(sessionId\)\}\/model/);
   assert.match(source, /require_model_lock/);
   assert.match(source, /Model lock failed|model lock failed/i);
 });
@@ -1253,7 +1254,7 @@ test('groupModelsForMenu groups connected Hermes models by provider and filters 
 
 test('normalizeHermesSessions and groupSessionsForMenu mirror Hermes Desktop source groups', () => {
   const sessions = normalizeHermesSessions({ data: [
-    { id: 'api_1', title: 'Reply with exactly OK.', source: 'api_server', last_active: 30, message_count: 2, model: 'qwen3.7-plus', provider: 'zenmux', input_tokens: 1200, output_tokens: 340, cache_read_tokens: 50, reasoning_tokens: 10, last_prompt_tokens: 29_577, context_length: 372_000, threshold_tokens: 316_200, usage_percent: 7.95, compression_count: 0 },
+    { id: 'api_1', title: 'Reply with exactly OK.', source: 'api_server', last_active: 30, message_count: 2, model: 'qwen3.7-plus', provider: 'zenmux', model_options: { reasoning: { enabled: true, effort: 'medium' }, reasoning_effort: 'medium', service_tier: null, fast: false }, input_tokens: 1200, output_tokens: 340, cache_read_tokens: 50, reasoning_tokens: 10, last_prompt_tokens: 29_577, context_length: 372_000, threshold_tokens: 316_200, usage_percent: 7.95, compression_count: 0 },
     { id: 'hb_1', title: 'Hermes Browser Extension', source: 'hermes_browser', last_active: 40, message_count: 1 },
     { id: 'tg_1', title: 'Telegram thread', source: 'telegram', last_active: 20, message_count: 10 },
   ] });
@@ -1261,6 +1262,13 @@ test('normalizeHermesSessions and groupSessionsForMenu mirror Hermes Desktop sou
   assert.equal(sessions[1].model, 'qwen3.7-plus');
   assert.equal(sessions[1].provider, 'zenmux');
   assert.equal(sessions[1].rawModelId, 'qwen3.7-plus');
+  assert.deepEqual(sessions[1].modelOptions, {
+    thinkingEnabled: true,
+    reasoningEffort: 'medium',
+    fastMode: false,
+    serviceTier: null,
+  });
+  assert.equal(sessions[0].modelOptions, null);
   assert.equal(sessions[1].inputTokens, 1200);
   assert.equal(sessions[1].outputTokens, 340);
   assert.equal(sessions[1].cacheReadTokens, 50);
@@ -1315,6 +1323,221 @@ test('acknowledged backend session model binding replaces a stale local session 
     sessionBinding: acknowledged,
     storedBinding: stored,
   }), acknowledged);
+});
+
+test('acknowledged session model options replace stale controls without changing future-session preferences', () => {
+  assert.equal(typeof common.resolveAcknowledgedSessionModelOptions, 'function');
+  const futureSessionPreference = {
+    thinkingEnabled: true,
+    reasoningEffort: 'low',
+    fastMode: true,
+    serviceTier: 'priority',
+  };
+  const storedSessionOptions = { ...futureSessionPreference };
+  const acknowledged = {
+    thinkingEnabled: true,
+    reasoningEffort: 'medium',
+    fastMode: false,
+    serviceTier: null,
+  };
+
+  assert.deepEqual(common.resolveAcknowledgedSessionModelOptions({
+    sessionOptions: acknowledged,
+    storedOptions: storedSessionOptions,
+  }), acknowledged);
+  assert.deepEqual(futureSessionPreference, {
+    thinkingEnabled: true,
+    reasoningEffort: 'low',
+    fastMode: true,
+    serviceTier: 'priority',
+  });
+});
+
+test('runtime option scope preserves the final Low to Medium and Fast off-on-off session state', () => {
+  assert.equal(typeof common.updateBrowserModelOptionScope, 'function');
+  assert.equal(typeof common.resolveBrowserEffectiveModelOptions, 'function');
+  let scoped = {
+    extensionPreferredModelOptions: {
+      thinkingEnabled: true,
+      reasoningEffort: 'low',
+      fastMode: false,
+      serviceTier: null,
+    },
+    sessionModelOptionBindings: {},
+  };
+
+  for (const options of [
+    { thinkingEnabled: true, reasoningEffort: 'medium', fastMode: false, serviceTier: null },
+    { thinkingEnabled: true, reasoningEffort: 'medium', fastMode: true, serviceTier: 'priority' },
+    { thinkingEnabled: true, reasoningEffort: 'medium', fastMode: false, serviceTier: null },
+  ]) {
+    scoped = common.updateBrowserModelOptionScope({
+      options,
+      sessionId: 'session_luna',
+      sessionModelOptionBindings: scoped.sessionModelOptionBindings,
+    });
+  }
+  const otherSessionBindings = {
+    ...scoped.sessionModelOptionBindings,
+    session_sol: {
+      thinkingEnabled: true,
+      reasoningEffort: 'xhigh',
+      fastMode: true,
+      serviceTier: 'priority',
+    },
+  };
+
+  assert.deepEqual(common.resolveBrowserEffectiveModelOptions({
+    sessionId: 'session_luna',
+    sessionModelOptionBindings: otherSessionBindings,
+    extensionPreferredModelOptions: scoped.extensionPreferredModelOptions,
+  }), {
+    thinkingEnabled: true,
+    reasoningEffort: 'medium',
+    fastMode: false,
+    serviceTier: null,
+  });
+  assert.equal(common.resolveBrowserEffectiveModelOptions({
+    sessionId: 'session_sol',
+    sessionModelOptionBindings: otherSessionBindings,
+    extensionPreferredModelOptions: scoped.extensionPreferredModelOptions,
+  }).reasoningEffort, 'xhigh');
+});
+
+test('runtime option settings persist future preferences separately from per-session bindings', () => {
+  assert.deepEqual(DEFAULT_SETTINGS.extensionPreferredModelOptions, {
+    thinkingEnabled: true,
+    reasoningEffort: 'xhigh',
+    fastMode: false,
+    serviceTier: null,
+  });
+  assert.deepEqual(DEFAULT_SETTINGS.sessionModelOptionBindings, {});
+});
+
+test('sidepanel hydrates acknowledged runtime options into the active session only', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /resolveAcknowledgedSessionModelOptions/);
+  assert.match(source, /resolveBrowserEffectiveModelOptions/);
+  assert.match(source, /updateBrowserModelOptionScope/);
+  assert.match(source, /sessionModelOptionBindings/);
+  assert.match(source, /extensionPreferredModelOptions/);
+  assert.match(source, /function applyModelOptionsForSession\(session = \{\}\)/);
+  assert.match(source, /applyModelBindingForSession\(session\);\s*applyModelOptionsForSession\(session\);/);
+});
+
+test('session option-only acknowledgements persist and rerender on refresh and session open', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /const previousOptionsBinding = JSON\.stringify\(settings\.sessionModelOptionBindings\?\.\[session\.id\] \|\| null\)/);
+  assert.match(source, /const nextOptionsBinding = JSON\.stringify\(settings\.sessionModelOptionBindings\?\.\[session\.id\] \|\| null\)/);
+  assert.match(source, /nextOptionsBinding !== previousOptionsBinding/);
+  assert.match(source, /applyModelOptionsForSession\(session\);\s*renderModelOptions\(availableModels\);/);
+});
+
+test('model option runtime acknowledgement distinguishes pending confirmed and mismatch states', () => {
+  assert.equal(typeof common.modelOptionsRuntimeAckState, 'function');
+  const requested = {
+    thinkingEnabled: true,
+    reasoningEffort: 'medium',
+    fastMode: false,
+    serviceTier: null,
+  };
+  assert.equal(common.modelOptionsRuntimeAckState({ requested, runtime: {} }).state, 'pending');
+  assert.deepEqual(common.modelOptionsRuntimeAckState({
+    requested,
+    runtime: {
+      model_options: {
+        reasoning: { enabled: true, effort: 'medium' },
+        reasoning_effort: 'medium',
+        fast: false,
+        service_tier: null,
+      },
+    },
+  }), {
+    state: 'confirmed',
+    detail: 'Thinking on · Medium · Fast off',
+  });
+  assert.equal(common.modelOptionsRuntimeAckState({
+    requested,
+    runtime: {
+      model_options: {
+        reasoning: { enabled: true, effort: 'low' },
+        fast: true,
+        service_tier: 'priority',
+      },
+    },
+  }).state, 'mismatch');
+});
+
+test('fast true without an explicit service tier confirms priority semantics', () => {
+  assert.equal(common.modelOptionsRuntimeAckState({
+    requested: {
+      thinkingEnabled: true,
+      reasoningEffort: 'medium',
+      fastMode: true,
+      serviceTier: 'priority',
+    },
+    runtime: {
+      model_options: {
+        reasoning: { enabled: true, effort: 'medium' },
+        fast: true,
+      },
+    },
+  }).state, 'confirmed');
+});
+
+test('thinking-off acknowledgement preserves the session effort for later re-enable', () => {
+  const storedOptions = {
+    thinkingEnabled: false,
+    reasoningEffort: 'medium',
+    fastMode: false,
+    serviceTier: null,
+  };
+  const acknowledged = {
+    reasoning: { enabled: false },
+    reasoning_effort: 'none',
+    fast: false,
+    service_tier: null,
+  };
+  assert.deepEqual(common.resolveAcknowledgedSessionModelOptions({
+    sessionOptions: acknowledged,
+    storedOptions,
+  }), storedOptions);
+  assert.equal(common.modelOptionsRuntimeAckState({
+    requested: storedOptions,
+    runtime: { model_options: acknowledged },
+  }).state, 'confirmed');
+});
+
+test('sidepanel keeps runtime option changes pending until the session resource confirms them', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /modelOptionsRuntimeAckState/);
+  assert.match(source, /async function fetchAcknowledgedSessionModelOptions/);
+  assert.match(source, /async function syncSessionModelOptions/);
+  assert.match(source, /void syncSessionModelOptions\(/);
+  assert.match(source, /await fetchAcknowledgedSessionModelOptions\(sessionId\)/);
+  assert.match(source, /if \(sessionId !== settings\.sessionId\) return \{ state: 'stale' \}/);
+  assert.match(source, /Hermes model options confirmed/);
+  assert.match(source, /Hermes model options pending/);
+  assert.match(source, /Hermes model options mismatch/);
+});
+
+test('runtime option acknowledgement ignores stale responses from rapid toggles', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /let modelOptionSelectionVersion = 0/);
+  assert.match(source, /modelOptionSelectionVersion \+= 1/);
+  assert.match(source, /optionVersion: modelOptionSelectionVersion/);
+  assert.match(source, /if \(optionVersion !== modelOptionSelectionVersion\) return \{ state: 'stale' \}/);
+});
+
+test('new API and dashboard sessions use future-session runtime option preferences', () => {
+  const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
+  assert.match(source, /function preferredModelOptionsForNewSession\(\)/);
+  assert.match(source, /const preferredOptions = preferredModelOptionsForNewSession\(\)/);
+  assert.match(source, /reasoning_effort: preferredOptions\.thinkingEnabled \? preferredOptions\.reasoningEffort : 'none'/);
+  assert.match(source, /fast: preferredOptions\.fastMode/);
+  assert.match(source, /model_options: buildHermesModelOptions\(preferredOptions\)/);
+  assert.match(source, /sessionModelOptionBindings:[\s\S]*?\[id\]: preferredOptions/);
+  assert.match(source, /sessionModelOptionBindings:[\s\S]*?\[session\.id\]: preferredOptions/);
 });
 
 test('legacy session metadata without a provider does not overwrite a local model selection', () => {
