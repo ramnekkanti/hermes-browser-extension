@@ -113,10 +113,15 @@ import {
   discoverModelsFromSessions,
   mergeModelsByRawId,
   mergeModelsWithRegistry,
+  MODEL_CATALOG_CACHE_STORAGE_KEY,
+  modelCatalogCacheKey,
   modelCatalogRefreshDecision,
+  normalizeCachedModelCatalog,
   normalizeExternalModelSourceList,
+  selectModelCatalogFallback,
   shouldTrySessionModelFallback,
 } from './lib/model-discovery.mjs';
+
 import {
   BUILTIN_COMMANDS,
   parseCommandInput,
@@ -3128,6 +3133,40 @@ function renderModelRefreshState() {
   }
 }
 
+async function readCachedModelCatalog() {
+  try {
+    const stored = await chrome.storage.local.get([MODEL_CATALOG_CACHE_STORAGE_KEY]);
+    const key = modelCatalogCacheKey({
+      gatewayMode: settings.gatewayMode,
+      gatewayUrl: settings.gatewayUrl,
+      profile: settings.activeProfile,
+    });
+    return normalizeCachedModelCatalog(stored?.[MODEL_CATALOG_CACHE_STORAGE_KEY]?.[key]?.models);
+  } catch {
+    return [];
+  }
+}
+
+async function writeCachedModelCatalog(models) {
+  const canonicalModels = normalizeCachedModelCatalog(models);
+  if (!canonicalModels.length) return;
+  try {
+    const stored = await chrome.storage.local.get([MODEL_CATALOG_CACHE_STORAGE_KEY]);
+    const cache = stored?.[MODEL_CATALOG_CACHE_STORAGE_KEY] && typeof stored[MODEL_CATALOG_CACHE_STORAGE_KEY] === 'object'
+      ? stored[MODEL_CATALOG_CACHE_STORAGE_KEY]
+      : {};
+    const key = modelCatalogCacheKey({
+      gatewayMode: settings.gatewayMode,
+      gatewayUrl: settings.gatewayUrl,
+      profile: settings.activeProfile,
+    });
+    cache[key] = { savedAt: Date.now(), models: canonicalModels };
+    await chrome.storage.local.set({ [MODEL_CATALOG_CACHE_STORAGE_KEY]: cache });
+  } catch {
+    // Catalog caching is resilience-only; storage failures must not block sync.
+  }
+}
+
 async function loadModels({ quiet = false, payload = null, refresh = false } = {}) {
   const previousSelectedModel = settings.model;
   const trackRefresh = Boolean(refresh && !payload);
@@ -3141,6 +3180,7 @@ async function loadModels({ quiet = false, payload = null, refresh = false } = {
     let data = payload;
     let registryModels = [];
     let registrySource = '';
+    const cachedCatalogModels = await readCachedModelCatalog();
 
     if (!data && isRemoteWsMode()) {
       // Remote reads go over the WS (REST is CORS-blocked). Only possible once
@@ -3174,16 +3214,29 @@ async function loadModels({ quiet = false, payload = null, refresh = false } = {
           registryModels = normalizeHermesModels(dashboardResult.models, settings.model);
           registrySource = 'dashboard';
         } else {
-          const response = await apiFetch('/v1/models', { method: 'GET' });
-          data = await readJsonResponse(response);
-          if (!response.ok) throw new Error(data?.error?.message || data?.error || `Model list failed (${response.status})`);
-          registryModels = normalizeHermesModels(data, settings.model);
-          registrySource = 'v1';
-          if (!quiet && registryResult.error && registryResult.error !== 'status-404') {
-            setStatus('warn', 'Model registry unavailable', `Falling back to /v1/models (${registryResult.error}).`);
+          const cachedFallback = selectModelCatalogFallback({ cachedModels: cachedCatalogModels });
+          if (cachedFallback.models.length) {
+            registryModels = normalizeHermesModels(cachedFallback.models, settings.model);
+            registrySource = cachedFallback.source;
+            if (!quiet) {
+              setStatus('warn', 'Using cached Hermes catalog', 'The live model catalog is unavailable; keeping the last verified provider/model list.');
+            }
+          } else {
+            const response = await apiFetch('/v1/models', { method: 'GET' });
+            data = await readJsonResponse(response);
+            if (!response.ok) throw new Error(data?.error?.message || data?.error || `Model list failed (${response.status})`);
+            registryModels = normalizeHermesModels(data, settings.model);
+            registrySource = 'v1';
+            if (!quiet && registryResult.error && registryResult.error !== 'status-404') {
+              setStatus('warn', 'Model registry unavailable', `Falling back to /v1/models (${registryResult.error}).`);
+            }
           }
         }
       }
+    }
+
+    if (registryModels.length && ['registry', 'dashboard'].includes(registrySource)) {
+      await writeCachedModelCatalog(registryModels);
     }
 
     // If the gateway only exposes a single OpenAI-compatible row, keep a
@@ -3253,6 +3306,8 @@ async function loadModels({ quiet = false, payload = null, refresh = false } = {
           ? 'from Hermes dashboard'
           : registrySource === 'sessions'
             ? 'from session history'
+            : registrySource === 'cache'
+              ? 'from the last verified Hermes catalog'
             : registrySource.includes('external')
               ? 'from Hermes plus custom model sources'
               : 'from local Hermes';
