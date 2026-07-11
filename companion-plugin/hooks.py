@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .context_store import _meaningful_text_from_content_list as _content_list_to_str
+
 if TYPE_CHECKING:
     from .context_store import BrowserContextStore
 
@@ -36,10 +38,17 @@ def _ensure_store() -> BrowserContextStore:
 
 
 def _last_user_message(**kwargs: Any) -> str:
-    """Return the current/last user message from Hermes hook kwargs."""
+    """Return the current/last user message from Hermes hook kwargs.
+
+    Handles both plain string content and content arrays (OpenAI format
+    ``[{type: "text", text: "..."}, ...]``) used by modern Hermes
+    versions when attachments are present.
+    """
     user_message = kwargs.get("user_message")
     if isinstance(user_message, str):
         return user_message
+    if isinstance(user_message, list):
+        return _content_list_to_str(user_message)
 
     history = kwargs.get("conversation_history") or kwargs.get("messages") or []
     if not isinstance(history, list):
@@ -48,6 +57,8 @@ def _last_user_message(**kwargs: Any) -> str:
     for msg in reversed(history):
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content", "")
+            if isinstance(content, list):
+                return _content_list_to_str(content)
             return str(content) if content else ""
     return ""
 

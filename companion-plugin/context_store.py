@@ -57,6 +57,24 @@ def _section_key(label: str) -> str:
     return label.strip().lower().replace(" ", "_").replace("/", "_")
 
 
+from typing import Any as _Any
+
+def _meaningful_text_from_content_list(parts: list[_Any]) -> str:
+    """Flatten a content array (OpenAI format) into a single string.
+
+    A content array looks like:
+        [{"type": "text", "text": "Hello"}, {"type": "image_url", ...}]
+    Returns the concatenated text parts for browser-context scanning.
+    """
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text", "")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text)
+    return "\n".join(chunks)
+
+
 def _meaningful_section_text(lines: list[str] | None) -> str:
     if not lines:
         return ""
