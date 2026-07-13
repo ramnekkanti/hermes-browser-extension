@@ -107,6 +107,52 @@ function reapplyPanelResidencyForTab(tabId) {
     .catch((error) => console.warn('[Hermes Browser] Could not apply panel residency setting:', error));
 }
 
+const pendingPanelTabOpens = new Map();
+
+async function openOrFocusPanelTab(panelUrl) {
+  const pendingOpen = pendingPanelTabOpens.get(panelUrl);
+  if (pendingOpen) return pendingOpen;
+
+  const openOperation = (async () => {
+    let existingTab = null;
+    try {
+      const candidates = await chrome.tabs.query({});
+      existingTab = candidates.find((candidate) => (
+        candidate.url === panelUrl || candidate.pendingUrl === panelUrl
+      )) || null;
+    } catch (queryError) {
+      console.warn('[Hermes Browser] Could not search for an existing fallback tab:', queryError);
+    }
+
+    if (Number.isFinite(existingTab?.id)) {
+      try {
+        const activatedTab = await chrome.tabs.update(existingTab.id, { active: true });
+        if (Number.isFinite(existingTab.windowId) && chrome.windows?.update) {
+          try {
+            await chrome.windows.update(existingTab.windowId, { focused: true });
+          } catch (focusError) {
+            console.warn('[Hermes Browser] Could not focus the existing fallback window:', focusError);
+          }
+        }
+        return activatedTab || existingTab;
+      } catch (activateError) {
+        console.warn('[Hermes Browser] Existing fallback tab disappeared before activation:', activateError);
+      }
+    }
+
+    return chrome.tabs.create({ url: panelUrl, active: true });
+  })();
+
+  pendingPanelTabOpens.set(panelUrl, openOperation);
+  try {
+    return await openOperation;
+  } finally {
+    if (pendingPanelTabOpens.get(panelUrl) === openOperation) {
+      pendingPanelTabOpens.delete(panelUrl);
+    }
+  }
+}
+
 async function openHermesPanel(tab) {
   await refreshPanelResidencyModeFromStorage();
   const panelResidencyMode = cachedPanelResidencyMode;
@@ -131,6 +177,7 @@ async function openHermesPanel(tab) {
   try {
     if (sidePanelCanOpen) {
       await applyPanelResidencyMode(panelResidencyMode, { tabId: useTabAttached ? tabId : null });
+      let attemptedWindowScope = false;
       if (useTabAttached) {
         try {
           const panelOpened = await openSidePanelWithConfirmation({
@@ -143,6 +190,7 @@ async function openHermesPanel(tab) {
         } catch (tabOpenError) {
           if (!tab?.windowId) throw tabOpenError;
           const { windowId } = tab;
+          attemptedWindowScope = true;
           console.warn('[Hermes Browser] Tab side panel open failed, retrying window side panel:', tabOpenError);
           const panelOpened = await openSidePanelWithConfirmation({
             sidePanelApi: chrome.sidePanel,
@@ -153,7 +201,7 @@ async function openHermesPanel(tab) {
           if (panelOpened) return;
         }
       }
-      if (tab?.windowId) {
+      if (tab?.windowId && !attemptedWindowScope) {
         const { windowId } = tab;
         const panelOpened = await openSidePanelWithConfirmation({
           sidePanelApi: chrome.sidePanel,
@@ -188,8 +236,8 @@ async function openHermesPanel(tab) {
     }
   }
 
-  // Last resort: open as extension tab
-  await chrome.tabs.create({ url: chrome.runtime.getURL(panelPath) });
+  // Last resort: reuse the matching extension tab or create it once.
+  await openOrFocusPanelTab(panelUrl);
 }
 
 async function openHermesFullView(requestedUrl = '') {

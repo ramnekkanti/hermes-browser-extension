@@ -79,11 +79,18 @@ test('side-panel confirmation rejects a silent no-op so the caller can use its t
   assert.equal(opened, false);
 });
 
-test('background action uses the extension-tab fallback when sidePanel.open silently no-ops', async () => {
-  const originalChrome = globalThis.chrome;
-  let actionHandler = null;
+function createBackgroundHarness({
+  sidePanelOpen = async () => {},
+  synchronizeFallbackQueries = false,
+} = {}) {
+  const activeTab = { id: 7, windowId: 8 };
+  const extensionTabs = [];
   const createdTabs = [];
-  globalThis.chrome = {
+  const updatedTabs = [];
+  const focusedWindows = [];
+  const sidePanelOpenCalls = [];
+  let actionHandler = null;
+  const chromeApi = {
     runtime: {
       getManifest: () => ({ side_panel: { default_path: 'sidepanel.html' } }),
       getURL: (value) => `chrome-extension://test/${value}`,
@@ -105,28 +112,106 @@ test('background action uses the extension-tab fallback when sidePanel.open sile
       onClicked: { addListener(handler) { actionHandler = handler; } },
     },
     tabs: {
-      query: async () => [{ id: 7, windowId: 8 }],
-      create: async (options) => { createdTabs.push(options); },
+      query: async () => {
+        const snapshot = [activeTab, ...extensionTabs];
+        if (synchronizeFallbackQueries) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return snapshot;
+      },
+      create: async (options) => {
+        createdTabs.push(options);
+        const created = { id: 100 + createdTabs.length, windowId: 8, pendingUrl: options.url };
+        extensionTabs.push(created);
+        return created;
+      },
+      update: async (tabId, options) => {
+        updatedTabs.push({ tabId, options });
+        return extensionTabs.find((tab) => tab.id === tabId) || null;
+      },
       onActivated: { addListener() {} },
     },
     sidePanel: {
       setPanelBehavior: async () => {},
       setOptions: async () => {},
-      open: async () => {},
+      open: async (options) => {
+        sidePanelOpenCalls.push(options);
+        return sidePanelOpen(options);
+      },
       onOpened: {
         addListener() {},
         removeListener() {},
       },
     },
-    windows: { create: async () => {} },
+    windows: {
+      create: async () => {},
+      update: async (windowId, options) => { focusedWindows.push({ windowId, options }); },
+    },
   };
+
+  return {
+    chromeApi,
+    activeTab,
+    createdTabs,
+    updatedTabs,
+    focusedWindows,
+    sidePanelOpenCalls,
+    get actionHandler() { return actionHandler; },
+  };
+}
+
+test('background action reuses the extension-tab fallback across repeated silent side-panel no-ops', async () => {
+  const originalChrome = globalThis.chrome;
+  const harness = createBackgroundHarness();
+  globalThis.chrome = harness.chromeApi;
 
   try {
     await import(`../extension/background.js?silent-side-panel=${Date.now()}`);
-    assert.equal(typeof actionHandler, 'function');
-    await actionHandler({ id: 7, windowId: 8 });
-    assert.equal(createdTabs.length, 1);
-    assert.equal(createdTabs[0].url, 'chrome-extension://test/sidepanel.html?panel=tab&tabId=7');
+    assert.equal(typeof harness.actionHandler, 'function');
+    await harness.actionHandler(harness.activeTab);
+    await harness.actionHandler(harness.activeTab);
+    assert.equal(harness.createdTabs.length, 1, 'repeated fallback clicks must not create duplicate tabs');
+    assert.equal(harness.createdTabs[0].url, 'chrome-extension://test/sidepanel.html?panel=tab&tabId=7');
+    assert.deepEqual(harness.updatedTabs, [{ tabId: 101, options: { active: true } }]);
+    assert.deepEqual(harness.focusedWindows, [{ windowId: 8, options: { focused: true } }]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test('background action coalesces concurrent silent side-panel fallbacks', async () => {
+  const originalChrome = globalThis.chrome;
+  const harness = createBackgroundHarness({ synchronizeFallbackQueries: true });
+  globalThis.chrome = harness.chromeApi;
+
+  try {
+    await import(`../extension/background.js?concurrent-side-panel=${Date.now()}`);
+    assert.equal(typeof harness.actionHandler, 'function');
+    await Promise.all([
+      harness.actionHandler(harness.activeTab),
+      harness.actionHandler(harness.activeTab),
+    ]);
+    assert.equal(harness.createdTabs.length, 1, 'concurrent fallback clicks must share one tab open');
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test('background action retries a failed tab-scoped side-panel open at window scope only once', async () => {
+  const originalChrome = globalThis.chrome;
+  const harness = createBackgroundHarness({
+    sidePanelOpen: async (options) => {
+      if ('tabId' in options) throw new Error('tab-scoped side panel unavailable');
+    },
+  });
+  globalThis.chrome = harness.chromeApi;
+
+  try {
+    await import(`../extension/background.js?single-window-retry=${Date.now()}`);
+    assert.equal(typeof harness.actionHandler, 'function');
+    await harness.actionHandler(harness.activeTab);
+    assert.deepEqual(harness.sidePanelOpenCalls, [{ tabId: 7 }, { windowId: 8 }]);
+    assert.equal(harness.createdTabs.length, 1);
   } finally {
     globalThis.chrome = originalChrome;
   }
