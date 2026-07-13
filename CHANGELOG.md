@@ -52,7 +52,6 @@
 
 ### Release theme
 - Supportability and integration bridge release: read-only foundation, Browser Context Protocol receipts, sanitized context cache, session control, and Browser-scoped model selection.
-- Launch ad asset prepared at `assets/readme/hermes-browser-update-ad-v010.png`.
 
 ### Companion Plugin MVP
 - Activated `companion-plugin/` from skeleton into an optional functional Hermes plugin with four read-only tools: `browser_context_status`, `browser_get_context`, `browser_clear_context`, and `browser_event_log`.

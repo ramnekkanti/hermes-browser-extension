@@ -7,6 +7,10 @@ artifacts/
 build-info.json
 extension/build-info.json
 
+# Release notes and launch ads belong on GitHub Releases, not source control
+RELEASE-v*.md
+assets/readme/*-ad*
+
 # Local QA/temp work
 tmp/
 .hermes/
