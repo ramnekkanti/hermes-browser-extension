@@ -10,3 +10,4 @@ Thanks to everyone who has contributed to Hermes Browser Extension.
 | [ptaranat](https://github.com/ptaranat) | Remote dashboard gateway/WebSocket mode groundwork in [PR #15](https://github.com/abundantbeing/hermes-browser-extension/pull/15). |
 | [barteqpl](https://github.com/barteqpl) | Native Opera sidebar support, manually integrated and hardened from [PR #30](https://github.com/abundantbeing/hermes-browser-extension/pull/30). |
 | [bradlishman](https://github.com/bradlishman) | Scoped, read-only element picker and prompt-boundary integration, folded and hardened from [PR #29](https://github.com/abundantbeing/hermes-browser-extension/pull/29). |
+| [Doom-pixel-alt](https://github.com/Doom-pixel-alt) | Restricted-URL, GitHub CLI path, and Windows setup secret-handling hardening identified in [PR #33](https://github.com/abundantbeing/hermes-browser-extension/pull/33). |
